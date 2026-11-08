@@ -7,7 +7,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from bot.media import run_media_command
+from bot.media import sample_video
 
 
 def _allowed(url: str) -> bool:
@@ -82,6 +82,5 @@ async def download_public_media(item: dict) -> bytes:
     data = await _download(item["url"], 10_000_000)
     if item["kind"] == "photo":
         # Public GIF search can also supply a static reaction picture.
-        return await run_media_command("ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-                                       "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1", data=data)
+        return (await sample_video(data))[0]
     return data

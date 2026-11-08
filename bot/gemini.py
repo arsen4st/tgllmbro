@@ -30,6 +30,10 @@ LOOKUP_TOOLS = {
     "search_web",
     "read_url",
     "read_attachment",
+    "search_media",
+    "search_public_media",
+    "save_media",
+    "get_creator_history",
 }
 
 
@@ -847,6 +851,15 @@ def _build_group_tools() -> types.Tool:
     query = {"type": "string", "description": "короткий смысловой поисковый запрос"}
     return types.Tool(
         function_declarations=[
+            _declaration("search_media", "Найти сохранённое медиа этого чата или общей коллекции по описанию.",
+                {"query": query, "kind": {"type": "string", "enum": ["any", "photo", "animation", "sticker", "voice", "audio", "video", "video_note", "document"]}}, ["query"]),
+            _declaration("search_public_media", "Поиск GIF/картинок-реакций Tenor и звуков Myinstants. Не вызывает inline-ботов. Можно искать коротко по-английски.",
+                {"query": query, "kind": {"type": "string", "enum": ["photo", "animation", "voice"]}}, ["query", "kind"]),
+            _declaration("send_media", "Отправить найденное медиа: media_id из search_media ИЛИ web_id из search_public_media. Только один источник.",
+                {"target_message_id": target, "media_id": {"type": "integer"}, "web_id": {"type": "string"}, "caption": {"type": "string"}}, ["target_message_id"]),
+            _declaration("save_media", "Сохранить вложение/цитату по явной команде владельца. Получить реальный результат перед подтверждением.",
+                {"target_message_id": target, "description": {"type": "string"}}, ["target_message_id"]),
+            _declaration("get_creator_history", "Прочитать подтверждённую историю создания и доступные факты о владельце; вместо выдуманной биографии.", {}, []),
             _declaration(
                 "search_memory",
                 "Гибридный поиск устойчивых фактов и локальных шуток этого чата.",

@@ -73,6 +73,10 @@ def build_router(
             "/addmeme описание — ответом на картинку добавить мем в базу.\n"
             "/addsticker описание — ответом на стикер добавить его в базу.\n"
             "/addsound описание — ответом на войс или аудио добавить звуковой мем.\n"
+            "/gif, /pic, /sound, /sticker запрос — найти и отправить медиа.\n"
+            "/save название — сохранить вложение из reply (только владелец).\n"
+            "/pack ссылка — добавить стикерпак для этого чата (только владелец).\n"
+            "/creator — история создания.\n"
             "/addmlbb заголовок | факт | ссылка — добавить проверенный факт по MLBB."
         )
 
@@ -193,6 +197,9 @@ def build_router(
             return
         command, _, query = (message.text or "").partition(" ")
         name = command.split("@")[0].lstrip("/")
+        if name in {"pic", "gif", "sound", "sticker"} and not query.strip():
+            await message.answer(f"напиши, что искать: /{name} кот")
+            return
         if name == "pack":
             if message.from_user is None or message.from_user.id != owner_telegram_id:
                 return
@@ -202,7 +209,8 @@ def build_router(
         phrases = {"pic": "найди и отправь картинку ", "gif": "найди и отправь гифку ",
                    "sound": "найди и отправь звуковой мем ", "sticker": "найди и отправь стикер ",
                    "save": "сохрани ", "creator": "расскажи историю своего создателя "}
-        event = replace(_event_from_message(message), text=phrases[name] + query, directed_to_bot=True)
+        payload = "название — " + query if name == "save" and query.strip() else query
+        event = replace(_event_from_message(message), text=phrases[name] + payload, directed_to_bot=True)
         if await group_agent.handle_owner_command(message.chat.id, event):
             return
         if name == "save":

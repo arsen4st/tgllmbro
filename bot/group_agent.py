@@ -394,11 +394,11 @@ class GroupAgent:
         if _owner_save_request(event.text):
             result = await self.save_owner_media(chat_id, event)
             text = str(result.get("message") or result.get("error"))
-        elif command.startswith("запомни обо мне"):
-            payload = command.removeprefix("запомни обо мне").lstrip(" :,")
-            public = payload.startswith("для всех:")
+        elif command.casefold().startswith("запомни обо мне"):
+            payload = command[len("запомни обо мне"):].lstrip(" :,")
+            public = payload.casefold().startswith("для всех:")
             if public:
-                payload = payload.removeprefix("для всех:").strip()
+                payload = payload[len("для всех:"):].strip()
             key, separator, value = payload.partition("=")
             if not separator:
                 key, value = payload[:60], payload
@@ -518,6 +518,8 @@ class GroupAgent:
                 token = secrets.token_urlsafe(9)
                 self._public_media[(batch.chat_id, token)] = (now, item)
                 results.append({"web_id": token, "kind": item["kind"], "description": item["description"], "source": item["source"]})
+            while len(self._public_media) > 200:
+                self._public_media.pop(next(iter(self._public_media)))
             return {"ok": True, "results": results, "note": "Это описания источника, а не просмотр содержимого моделью"}
         if action.name == "search_memory":
             query = _required_text(action, "query")
@@ -825,7 +827,7 @@ class GroupAgent:
         limits: Counter[str] = Counter()
         replied_targets: set[int] = set()
         for action in actions:
-            sent_before = sum(limits[key] for key in ("reply", "interject", "meme", "sticker", "sound", "voice"))
+            sent_before = sum(limits[key] for key in ("reply", "interject", "meme", "sticker", "sound", "voice", "media"))
             try:
                 if action.name == "reply_to_message" and limits["reply"] < 2:
                     target = _target_id(action, conversational_targets)
@@ -987,6 +989,43 @@ class GroupAgent:
                         )
                         limits["sound"] += 1
 
+                elif action.name == "send_media" and limits["media"] < 1:
+                    target = _target_id(action, conversational_targets)
+                    caption = str(action.arguments.get("caption", "")).strip()[:1000]
+                    media_id = _optional_int(action.arguments.get("media_id"))
+                    web_id = str(action.arguments.get("web_id", "")).strip()
+                    media = None
+                    kind = description = ""
+                    if target is not None:
+                        if bool(media_id) == bool(web_id):
+                            raise ValueError("Нужен ровно один источник медиа")
+                        if media_id:
+                            saved = await self._store.get_media(chat_id=batch.chat_id, media_id=media_id)
+                            if saved is not None:
+                                kind, media, description = saved["kind"], saved["file_id"], saved["description"]
+                        elif web_id:
+                            found = self._public_media.get((batch.chat_id, web_id))
+                            if found is not None and monotonic() - found[0] < 600:
+                                item = found[1]
+                                kind, description = item["kind"], item["description"]
+                                data = await download_public_media(item)
+                                if kind == "voice":
+                                    data = await _wav_to_ogg(data)
+                                extension = {"photo": "jpg", "voice": "ogg"}.get(kind, item["url"].rsplit(".", 1)[-1])
+                                media = BufferedInputFile(data, filename=f"media.{extension}")
+                                caption = (caption[:650] + "\n" + item["source"]).strip()
+                        if media is None:
+                            raise ValueError("Медиа недоступно в этом чате или результат поиска устарел")
+                        if media is not None:
+                            sent = await self._send_media(batch.chat_id, target, kind, media, caption)
+                            await self._record_bot_message(
+                                sent.message_id,
+                                batch.chat_id,
+                                caption or f"[{kind}: {description[:300]}]",
+                                target=target,
+                            )
+                            limits["media"] += 1
+
                 elif action.name == "speak_to_message" and limits["voice"] < 1:
                     target = _target_id(action, conversational_targets)
                     text = str(action.arguments.get("text", "")).strip()[:700]
@@ -1052,7 +1091,7 @@ class GroupAgent:
                             value=value,
                         )
                         limits["profile"] += 1
-                sent_after = sum(limits[key] for key in ("reply", "interject", "meme", "sticker", "sound", "voice"))
+                sent_after = sum(limits[key] for key in ("reply", "interject", "meme", "sticker", "sound", "voice", "media"))
                 if sent_after > sent_before:
                     anchor = _target_id(action, valid_targets)
                     event = next((item for item in batch.events if item.telegram_message_id == anchor), batch.events[-1])
@@ -1063,6 +1102,27 @@ class GroupAgent:
                     action.name,
                     batch.chat_id,
                 )
+                if action.name == "send_media":
+                    target = _target_id(action, conversational_targets)
+                    if target is not None:
+                        await self._send_reply(batch.chat_id, target, "не получилось отправить этот файл. попробуй другой запрос")
+
+    async def _send_media(self, chat_id: int, target: int, kind: str, media: str | BufferedInputFile, caption: str):
+        reply = _reply_parameters(target)
+        caption_or_none = caption or None
+        if kind == "sticker":
+            return await self._bot.send_sticker(chat_id=chat_id, sticker=media, reply_parameters=reply)
+        if kind == "video_note":
+            return await self._bot.send_video_note(chat_id=chat_id, video_note=media, reply_parameters=reply)
+        senders = {
+            "animation": (self._bot.send_animation, "animation"),
+            "photo": (self._bot.send_photo, "photo"),
+            "video": (self._bot.send_video, "video"),
+            "voice": (self._bot.send_voice, "voice"),
+            "audio": (self._bot.send_audio, "audio"),
+        }
+        send, field = senders.get(kind, (self._bot.send_document, "document"))
+        return await send(chat_id=chat_id, **{field: media}, caption=caption_or_none, reply_parameters=reply)
 
     async def _send_reply(self, chat_id: int, target: int, text: str) -> None:
         for index, chunk in enumerate(_split_text(text)):
@@ -1094,11 +1154,11 @@ class GroupAgent:
 
 def _owner_command_text(text: str) -> str:
     text = re.sub(r"^\[[^\]\n]+\]\s*", "", text.strip())
-    return re.sub(r"^(?:@[\w]+|лисун(?:\s+син)?|yss)[\s,:]*", "", text, flags=re.I).strip().casefold()
+    return re.sub(r"^(?:@[\w]+|лисун(?:\s+син)?|yss)[\s,:]*", "", text, flags=re.I).strip()
 
 
 def _owner_save_request(text: str) -> bool:
-    return bool(re.match(r"^(?:сохрани|сохраняй|добавь\s+в\s+(?:базу|коллекцию|медиатеку))\b", _owner_command_text(text)))
+    return bool(re.match(r"^(?:сохрани|сохраняй|добавь\s+в\s+(?:базу|коллекцию|медиатеку))\b", _owner_command_text(text), re.I))
 
 
 def _render_events(events: Iterable[ChatEvent], *, max_text: int = 1500) -> str:

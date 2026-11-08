@@ -1261,7 +1261,16 @@ class MessageStore:
     async def search_media(self, *, chat_id: int, query: str, kind: str = "any") -> list[dict]:
         fts = _fts_query(query)
         if not fts:
-            return []
+            if not query.strip():
+                return []
+            cursor = await self._require_connection().execute(
+                """SELECT id,kind,description FROM media_library WHERE scope_chat IN (0,?)
+                   AND (?='any' OR kind=?) AND instr(description,?)>0 ORDER BY id DESC LIMIT 8""",
+                (chat_id, kind, kind, query.strip()),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [{"media_id": row[0], "kind": row[1], "description": row[2]} for row in rows]
         cursor = await self._require_connection().execute(
             """SELECT m.id,m.kind,m.description FROM media_library_fts
                JOIN media_library m ON m.id=media_library_fts.rowid
