@@ -27,6 +27,7 @@ from bot.batcher import MessageBatch
 from bot.database import (
     ChatEvent,
     KnowledgeItem,
+    MediaItem,
     MemeItem,
     MemoryItem,
     MessageStore,
@@ -74,6 +75,13 @@ class GroupAgent:
         memory_results: int,
         style_results: int,
         owner_telegram_id: int = 0,
+        summary_trigger_events: int = 40,
+        summary_batch_events: int = 100,
+        recent_context_chars: int = 8000,
+        summary_context_chars: int = 3500,
+        profile_context_chars: int = 3000,
+        new_context_chars: int = 12000,
+        style_context_chars: int = 3000,
     ) -> None:
         self._bot = bot
         self._bot_id = bot_id
@@ -84,6 +92,16 @@ class GroupAgent:
         self._memory_results = memory_results
         self._style_results = style_results
         self._owner_id = owner_telegram_id
+        self._summary_trigger_events = summary_trigger_events
+        self._summary_batch_events = max(summary_trigger_events, summary_batch_events)
+        self._recent_context_chars = recent_context_chars
+        self._summary_context_chars = summary_context_chars
+        self._profile_context_chars = profile_context_chars
+        self._new_context_chars = new_context_chars
+        self._style_context_chars = style_context_chars
+        self._maintenance_queue: asyncio.Queue[int | None] = asyncio.Queue()
+        self._maintenance_pending: set[int] = set()
+        self._maintenance_task: asyncio.Task[None] | None = None
         self._public_media: dict[tuple[int, str], tuple[float, dict]] = {}
         self._chat_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._last_interjection_at: dict[int, float] = {}
@@ -93,6 +111,139 @@ class GroupAgent:
         self._conversation_open_until: dict[int, float] = {}
         self._conversation_followups_left: dict[int, int] = {}
         self._conversation_participants: dict[int, int] = {}
+
+    async def start_background(self) -> None:
+        if self._maintenance_task is None:
+            self._maintenance_task = asyncio.create_task(
+                self._maintenance_worker(), name="chat-memory-maintenance"
+            )
+
+    async def close_background(self) -> None:
+        if self._maintenance_task is None:
+            return
+        await self._maintenance_queue.join()
+        await self._maintenance_queue.put(None)
+        await self._maintenance_task
+        self._maintenance_task = None
+
+    def _schedule_maintenance(self, chat_id: int) -> None:
+        if chat_id in self._maintenance_pending:
+            return
+        self._maintenance_pending.add(chat_id)
+        self._maintenance_queue.put_nowait(chat_id)
+
+    async def _maintenance_worker(self) -> None:
+        while True:
+            chat_id = await self._maintenance_queue.get()
+            try:
+                if chat_id is None:
+                    return
+                self._maintenance_pending.discard(chat_id)
+                await self._maintain_chat_memory(chat_id)
+            except Exception:
+                logger.exception("Background memory maintenance failed chat_id=%s", chat_id)
+            finally:
+                self._maintenance_queue.task_done()
+
+    async def _maintain_chat_memory(self, chat_id: int) -> None:
+        await self._backfill_media_embeddings(chat_id)
+        while True:
+            rows = await self._store.get_unsummarized_chat_events(
+                chat_id=chat_id,
+                limit=self._summary_batch_events,
+            )
+            if len(rows) < self._summary_trigger_events:
+                return
+            previous = await self._store.get_chat_summary(chat_id=chat_id)
+            rendered = _render_events(
+                [event for _, event in rows], max_text=1000
+            )
+            reflection = await self._assistant.reflect_chat(
+                previous_summary=_head_chars(previous, 4500),
+                messages=_head_chars(rendered, 24000),
+            )
+            segment = str(reflection.get("segment") or "").strip()[:1800]
+            snapshot = str(reflection.get("snapshot") or "").strip()[:4500]
+            if not segment or not snapshot:
+                raise RuntimeError("Фоновая рефлексия не вернула саммарилог")
+
+            names = {
+                event.sender_id: event.sender_name
+                for _, event in rows
+                if event.role == "user" and event.sender_id != self._bot_id
+            }
+            memory_candidates: list[tuple[str, float, str]] = []
+            for item in list(reflection.get("memories") or [])[:6]:
+                if not isinstance(item, dict):
+                    continue
+                fact = str(item.get("fact") or "").strip()[:1000]
+                importance = _bounded_float(item.get("importance"), 0.0, 1.0, 0.5)
+                kind = _memory_kind(item.get("kind"))
+                if fact:
+                    memory_candidates.append((fact, importance, kind))
+            embeddings = await self._assistant.embed_documents(
+                [("background chat memory", fact) for fact, _, _ in memory_candidates]
+            )
+            for (fact, importance, kind), embedding in zip(
+                memory_candidates, embeddings
+            ):
+                await self._store.add_memory(
+                    chat_id=chat_id,
+                    text=fact,
+                    embedding=embedding,
+                    importance=importance,
+                    kind=kind,
+                )
+            for item in list(reflection.get("profiles") or [])[:8]:
+                if not isinstance(item, dict):
+                    continue
+                user_id = _optional_int(item.get("user_id"))
+                confidence = _bounded_float(item.get("confidence"), 0.0, 1.0, 0.0)
+                key = str(item.get("key") or "").strip().casefold()[:80]
+                value = str(item.get("value") or "").strip()[:500]
+                if user_id in names and confidence >= 0.85 and key and value:
+                    await self._store.upsert_user_profile_fact(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        display_name=names[user_id],
+                        key=key,
+                        value=value,
+                    )
+            await self._store.complete_summary_chunk(
+                chat_id=chat_id,
+                start_event_id=rows[0][0],
+                end_event_id=rows[-1][0],
+                segment=segment,
+                snapshot=snapshot,
+            )
+            logger.info(
+                "chat_summary_updated chat_id=%s events=%d end_event_id=%d",
+                chat_id,
+                len(rows),
+                rows[-1][0],
+            )
+
+    async def _backfill_media_embeddings(self, chat_id: int) -> None:
+        items = await self._store.get_media_without_embeddings(
+            chat_id=chat_id, limit=12
+        )
+        embeddings = await self._assistant.embed_documents(
+            [
+                (f"telegram {item.kind} reaction", item.description)
+                for item in items
+            ]
+        )
+        for item, embedding in zip(items, embeddings):
+            if any(embedding):
+                await self._store.set_media_embedding(
+                    media_id=item.id, embedding=embedding
+                )
+        if items:
+            logger.info(
+                "media_embeddings_backfilled chat_id=%s count=%d",
+                chat_id,
+                len(items),
+            )
 
     def claim_conversation_followup(self, chat_id: int, sender_id: int, text: str) -> bool:
         if self._conversation_participants.get(chat_id) != sender_id:
@@ -148,6 +299,7 @@ class GroupAgent:
                 chat_id=batch.chat_id,
                 events=batch.events,
             )
+            self._schedule_maintenance(batch.chat_id)
             logger.info(
                 "group_batch skipped_before_llm chat_id=%s messages=%d",
                 batch.chat_id,
@@ -166,6 +318,7 @@ class GroupAgent:
                 if observed:
                     recent[index] = replace(event, text=event.text + "\n[Ранее прочитанное вложение]\n" + observed[:2000])
         await self._store.append_chat_events(chat_id=batch.chat_id, events=batch.events)
+        self._schedule_maintenance(batch.chat_id)
         batch = await self._prepare_context(batch)
         participant_ids = {
             event.sender_id
@@ -176,12 +329,38 @@ class GroupAgent:
             chat_id=batch.chat_id,
             user_ids=participant_ids,
         )
-        rendered_new_messages = _render_events(batch.events, max_text=5500)
+        summary = await self._store.get_chat_summary(chat_id=batch.chat_id)
+        rendered_new_messages = _tail_chars(
+            _render_events(batch.events, max_text=5500), self._new_context_chars
+        )
         style_examples = await self._retrieve_style_examples("\n".join(event.text for event in batch.events))
         available_tools = await self._available_tools(batch, rendered_new_messages)
 
         retrieved_memory_ids: set[int] = set()
         lookup_limits: Counter[str] = Counter()
+
+        recent_context = _tail_chars(
+            _render_events(recent), self._recent_context_chars
+        )
+        summary_context = _head_chars(summary, self._summary_context_chars)
+        profile_context = _head_chars(
+            f"Создатель/владелец: user_id={self._owner_id}. Только этот ID имеет права сохранения.\n"
+            + _render_profiles(profiles),
+            self._profile_context_chars,
+        )
+        style_context = _head_chars(
+            _render_style_examples(style_examples), self._style_context_chars
+        )
+        logger.info(
+            "context_budget chat_id=%s recent_chars=%d summary_chars=%d "
+            "profile_chars=%d style_chars=%d new_chars=%d",
+            batch.chat_id,
+            len(recent_context),
+            len(summary_context),
+            len(profile_context),
+            len(style_context),
+            len(rendered_new_messages),
+        )
 
         async def execute_lookup(action: AgentAction) -> dict[str, object]:
             lookup_limits[action.name] += 1
@@ -194,9 +373,10 @@ class GroupAgent:
             )
 
         actions = await self._assistant.plan_group_actions(
-            recent_context=_render_events(recent),
-            user_profiles=f"Создатель/владелец: user_id={self._owner_id}. Только этот ID имеет права сохранения.\n" + _render_profiles(profiles),
-            style_examples=_render_style_examples(style_examples),
+            recent_context=recent_context,
+            summary_context=summary_context,
+            user_profiles=profile_context,
+            style_examples=style_context,
             new_messages=rendered_new_messages,
             available_tools=available_tools,
             tool_executor=execute_lookup,
@@ -429,9 +609,22 @@ class GroupAgent:
             except Exception:
                 logger.warning("media library description unavailable")
         description = description or source.text or source.media_kind
+        embedding = None
+        try:
+            embedding = await self._assistant.embed_document(
+                description, title=f"telegram {source.media_kind} reaction"
+            )
+            if not any(embedding):
+                embedding = None
+        except Exception:
+            logger.warning(
+                "media embedding unavailable; saved for lexical search",
+                exc_info=True,
+            )
         media_id = await self._store.save_media(scope_chat=0 if shared else chat_id,
             kind=source.media_kind, file_id=source.media_file_id, unique_id=source.media_unique_id,
-            description=description, source_chat=chat_id, source_message=source.telegram_message_id)
+            description=description, source_chat=chat_id,
+            source_message=source.telegram_message_id, embedding=embedding)
         scope = "для всех чатов" if shared else "для этого чата"
         return {"ok": True, "media_id": media_id, "message": f"сохранил {scope}: #{media_id} — {description[:180]}"}
 
@@ -506,9 +699,20 @@ class GroupAgent:
                 return {"ok": False, "error": "Нет такой команды в текущей пачке"}
             return await self.save_owner_media(batch.chat_id, event, str(action.arguments.get("description", ""))[:1500])
         if action.name == "search_media":
-            results = await self._store.search_media(chat_id=batch.chat_id, query=_required_text(action, "query"),
-                                                    kind=str(action.arguments.get("kind", "any")))
-            return {"ok": True, "results": results}
+            query = _required_text(action, "query")
+            kind = str(action.arguments.get("kind", "any"))
+            items = await self._find_media(batch.chat_id, query, kind, 8)
+            return {
+                "ok": True,
+                "results": [
+                    {
+                        "media_id": item.id,
+                        "kind": item.kind,
+                        "description": item.description,
+                    }
+                    for item in items
+                ],
+            }
         if action.name == "search_public_media":
             items = await search_public_media(_required_text(action, "query"), str(action.arguments.get("kind", "animation")))
             now = monotonic()
@@ -524,12 +728,20 @@ class GroupAgent:
         if action.name == "search_memory":
             query = _required_text(action, "query")
             limit = _bounded_int(action.arguments.get("limit"), 1, 10, self._memory_results)
-            memories = await self._retrieve_memories(batch.chat_id, query, limit)
+            kind = _memory_search_kind(action.arguments.get("kind"))
+            memories = await self._retrieve_memories(
+                batch.chat_id, query, limit, kind
+            )
             retrieved_memory_ids.update(item.id for item in memories)
             return {
                 "ok": True,
                 "results": [
-                    {"memory_id": item.id, "text": item.text, "importance": item.importance}
+                    {
+                        "memory_id": item.id,
+                        "text": item.text,
+                        "importance": item.importance,
+                        "kind": item.kind,
+                    }
                     for item in memories
                 ],
             }
@@ -646,8 +858,11 @@ class GroupAgent:
         chat_id: int,
         query: str,
         limit: int,
+        kind: str = "any",
     ) -> list[MemoryItem]:
-        candidates = await self._store.get_memory_candidates(chat_id=chat_id)
+        candidates = await self._store.get_memory_candidates(
+            chat_id=chat_id, kind=kind
+        )
         if not candidates:
             return []
         embedding, fts_ids = await asyncio.gather(
@@ -668,7 +883,7 @@ class GroupAgent:
     async def _find_memes(self, query: str, limit: int) -> list[MemeItem]:
         fts_ids = set(await self._store.search_meme_ids(query=query))
         candidates = await self._store.get_meme_candidates(
-            meme_ids=list(fts_ids) or None,
+            meme_ids=None,
             limit=1000,
         )
         if not candidates:
@@ -685,10 +900,35 @@ class GroupAgent:
             fts_ids=fts_ids,
         )
 
+    async def _find_media(
+        self, chat_id: int, query: str, kind: str, limit: int
+    ) -> list[MediaItem]:
+        candidates = await self._store.get_media_candidates(
+            chat_id=chat_id, kind=kind, limit=500
+        )
+        if not candidates:
+            return []
+        embedding, fts_ids = await asyncio.gather(
+            self._assistant.embed_query(query),
+            self._store.search_media_ids(
+                chat_id=chat_id, query=query, kind=kind
+            ),
+        )
+        return _hybrid_rank(
+            query=query,
+            query_embedding=embedding,
+            items=candidates,
+            text_getter=lambda item: f"{item.kind} {item.description}",
+            embedding_getter=lambda item: item.embedding,
+            importance_getter=lambda item: min(1.0, 0.5 + math.log1p(item.use_count) / 10),
+            limit=limit,
+            fts_ids=fts_ids,
+        )
+
     async def _find_sounds(self, query: str, limit: int) -> list[SoundItem]:
         fts_ids = set(await self._store.search_sound_ids(query=query))
         candidates = await self._store.get_sound_candidates(
-            sound_ids=list(fts_ids) or None,
+            sound_ids=None,
             limit=1000,
         )
         if not candidates:
@@ -708,7 +948,7 @@ class GroupAgent:
     async def _find_knowledge(self, query: str, limit: int) -> list[KnowledgeItem]:
         fts_ids = set(await self._store.search_knowledge_ids(query=query))
         candidates = await self._store.get_knowledge_candidates(
-            item_ids=list(fts_ids) or None,
+            item_ids=None,
             limit=1000,
         )
         if not candidates:
@@ -1024,6 +1264,8 @@ class GroupAgent:
                                 caption or f"[{kind}: {description[:300]}]",
                                 target=target,
                             )
+                            if media_id:
+                                await self._store.touch_media(media_id)
                             limits["media"] += 1
 
                 elif action.name == "speak_to_message" and limits["voice"] < 1:
@@ -1060,6 +1302,7 @@ class GroupAgent:
                 elif action.name == "remember" and limits["memory"] < 2:
                     fact = str(action.arguments.get("fact", "")).strip()[:1000]
                     importance = float(action.arguments.get("importance", 0.5))
+                    kind = _memory_kind(action.arguments.get("kind"))
                     if fact:
                         embedding = await self._assistant.embed_document(
                             fact,
@@ -1070,6 +1313,7 @@ class GroupAgent:
                             text=fact,
                             embedding=embedding,
                             importance=max(0.0, min(1.0, importance)),
+                            kind=kind,
                         )
                         limits["memory"] += 1
 
@@ -1224,6 +1468,38 @@ def _optional_int(value: object) -> int | None:
 def _bounded_int(value: object, minimum: int, maximum: int, default: int) -> int:
     parsed = _optional_int(value)
     return max(minimum, min(maximum, parsed if parsed is not None else default))
+
+
+def _bounded_float(
+    value: object, minimum: float, maximum: float, default: float
+) -> float:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _memory_kind(value: object) -> str:
+    kind = str(value or "fact").strip().casefold()
+    return kind if kind in {"fact", "event", "joke", "preference", "decision"} else "fact"
+
+
+def _memory_search_kind(value: object) -> str:
+    kind = str(value or "any").strip().casefold()
+    return kind if kind == "any" else _memory_kind(kind)
+
+
+def _head_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 24)] + "\n[дальше сокращено]"
+
+
+def _tail_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return "[начало сокращено]\n" + text[-max(0, limit - 21):]
 
 
 def _reply_parameters(target: int) -> ReplyParameters:

@@ -17,6 +17,7 @@ class Settings:
     openrouter_model: str
     owner_telegram_id: int
     gemini_model: str
+    background_model: str
     gemini_embedding_model: str
     gemini_tts_model: str
     gemini_tts_voice: str
@@ -31,6 +32,13 @@ class Settings:
     group_recent_events: int
     memory_results: int
     style_results: int
+    summary_trigger_events: int
+    summary_batch_events: int
+    recent_context_chars: int
+    summary_context_chars: int
+    profile_context_chars: int
+    new_context_chars: int
+    style_context_chars: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,6 +90,9 @@ class Settings:
             gemini_model=os.getenv(
                 "GEMINI_MODEL", "gemini-3.8-flash"
             ).strip(),
+            background_model=os.getenv(
+                "BACKGROUND_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+            ).strip(),
             gemini_embedding_model=os.getenv(
                 "GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"
             ).strip(),
@@ -104,6 +115,27 @@ class Settings:
             group_recent_events=_positive_int("GROUP_RECENT_EVENTS", default=15),
             memory_results=_positive_int("MEMORY_RESULTS", default=8),
             style_results=_positive_int("STYLE_RESULTS", default=4),
+            summary_trigger_events=_positive_int(
+                "SUMMARY_TRIGGER_EVENTS", default=40
+            ),
+            summary_batch_events=_positive_int(
+                "SUMMARY_BATCH_EVENTS", default=100
+            ),
+            recent_context_chars=_positive_int(
+                "RECENT_CONTEXT_CHARS", default=8000
+            ),
+            summary_context_chars=_positive_int(
+                "SUMMARY_CONTEXT_CHARS", default=3500
+            ),
+            profile_context_chars=_positive_int(
+                "PROFILE_CONTEXT_CHARS", default=3000
+            ),
+            new_context_chars=_positive_int(
+                "NEW_CONTEXT_CHARS", default=12000
+            ),
+            style_context_chars=_positive_int(
+                "STYLE_CONTEXT_CHARS", default=3000
+            ),
         )
 
 

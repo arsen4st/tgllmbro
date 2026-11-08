@@ -42,6 +42,7 @@ async def main() -> None:
         openrouter_api_key=settings.openrouter_api_key,
         openrouter_model=settings.openrouter_model,
         model=settings.gemini_model,
+        background_model=settings.background_model,
         embedding_model=settings.gemini_embedding_model,
         tts_model=settings.gemini_tts_model,
         tts_voice=settings.gemini_tts_voice,
@@ -68,6 +69,13 @@ async def main() -> None:
             memory_results=settings.memory_results,
             style_results=settings.style_results,
             owner_telegram_id=settings.owner_telegram_id,
+            summary_trigger_events=settings.summary_trigger_events,
+            summary_batch_events=settings.summary_batch_events,
+            recent_context_chars=settings.recent_context_chars,
+            summary_context_chars=settings.summary_context_chars,
+            profile_context_chars=settings.profile_context_chars,
+            new_context_chars=settings.new_context_chars,
+            style_context_chars=settings.style_context_chars,
         )
         group_batcher = GroupBatcher(
             processor=group_agent.process,
@@ -78,6 +86,7 @@ async def main() -> None:
             workers=settings.group_queue_workers,
         )
         await group_batcher.start()
+        await group_agent.start_background()
 
         dispatcher = Dispatcher()
         dispatcher.include_router(
@@ -97,6 +106,8 @@ async def main() -> None:
     finally:
         if group_batcher is not None:
             await group_batcher.close()
+        if 'group_agent' in locals():
+            await group_agent.close_background()
         await assistant.close()
         await store.close()
         await bot.session.close()

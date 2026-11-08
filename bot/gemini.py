@@ -60,6 +60,7 @@ class GeminiAssistant:
         tts_model: str,
         tts_voice: str,
         max_output_tokens: int,
+        background_model: str | None = None,
     ) -> None:
         self._client = genai.Client(api_key=api_key)
         self._anymodel = (
@@ -86,6 +87,7 @@ class GeminiAssistant:
         )
         self._openrouter_model = openrouter_model
         self._model = model
+        self._background_model = background_model or model
         self._embedding_model = embedding_model
         self._tts_model = tts_model
         self._tts_voice = tts_voice
@@ -236,6 +238,7 @@ class GeminiAssistant:
         self,
         *,
         recent_context: str,
+        summary_context: str,
         user_profiles: str,
         new_messages: str,
         style_examples: str,
@@ -257,6 +260,7 @@ class GeminiAssistant:
                     client=self._anymodel,
                     model=self._anymodel_model,
                     recent_context=recent_context,
+                    summary_context=summary_context,
                     user_profiles=user_profiles,
                     new_messages=new_messages,
                     style_examples=style_examples,
@@ -286,6 +290,7 @@ class GeminiAssistant:
                     client=self._openrouter,
                     model=self._openrouter_model,
                     recent_context=recent_context,
+                    summary_context=summary_context,
                     user_profiles=user_profiles,
                     new_messages=new_messages,
                     style_examples=style_examples,
@@ -319,6 +324,8 @@ class GeminiAssistant:
         prompt = (
             "НЕДАВНИЙ КОНТЕКСТ (только фон, отвечать можно лишь на новые id):\n"
             f"{recent_context or '(пусто)'}\n\n"
+            "САММАРИЛОГ (сжатая хронология; для точной цитаты используй search_archive):\n"
+            f"{summary_context or '(пусто)'}\n\n"
             "КАРТОЧКИ УЧАСТНИКОВ (устойчивые факты, не выдумывай новые):\n"
             f"{user_profiles or '(нет)'}\n\n"
             "ПОХОЖИЕ ПРИМЕРЫ (не обязательный шаблон; не переноси чужие факты, имена и ругань):\n"
@@ -397,6 +404,7 @@ class GeminiAssistant:
         client: AsyncOpenAI,
         model: str,
         recent_context: str,
+        summary_context: str,
         user_profiles: str,
         new_messages: str,
         style_examples: str,
@@ -407,6 +415,8 @@ class GeminiAssistant:
         prompt = (
             "НЕДАВНИЙ КОНТЕКСТ (только фон, отвечать можно лишь на новые id):\n"
             f"{recent_context or '(пусто)'}\n\n"
+            "САММАРИЛОГ (сжатая хронология; для точной цитаты используй search_archive):\n"
+            f"{summary_context or '(пусто)'}\n\n"
             "КАРТОЧКИ УЧАСТНИКОВ (устойчивые факты, не выдумывай новые):\n"
             f"{user_profiles or '(нет)'}\n\n"
             "ПОХОЖИЕ ПРИМЕРЫ (не обязательный шаблон; не переноси чужие факты, имена и ругань):\n"
@@ -767,19 +777,80 @@ class GeminiAssistant:
             raise RuntimeError("Vision-модель вернула пустой ответ")
         return text
 
+    async def reflect_chat(
+        self,
+        *,
+        previous_summary: str,
+        messages: str,
+    ) -> dict[str, Any]:
+        prompt = (
+            "Ты фоновый архивариус Telegram-чата. Обнови хронологическую выжимку "
+            "и извлеки только явно сообщённые устойчивые факты. Не домысливай, "
+            "не переноси цитаты одного человека в профиль другого, не сохраняй "
+            "пароли, токены, адреса и другие секреты. Ответь только JSON-объектом:\n"
+            '{"segment":"что произошло в новой пачке по порядку",'
+            '"snapshot":"обновлённая компактная хронология",'
+            '"memories":[{"fact":"факт или локальная шутка","importance":0.0,'
+            '"kind":"fact|event|joke|preference|decision"}],'
+            '"profiles":[{"user_id":123,"key":"короткий тип факта",'
+            '"value":"значение","confidence":0.0}]}\n'
+            "profiles: только факты с confidence >= 0.85; memories: максимум 6; "
+            "profiles: максимум 8; snapshot до 4500 символов, segment до 1800.\n\n"
+            "ПРЕДЫДУЩАЯ ХРОНОЛОГИЯ:\n"
+            f"{previous_summary or '(пусто)'}\n\n"
+            "НОВЫЕ СООБЩЕНИЯ:\n"
+            f"{messages}"
+        )
+        started = perf_counter()
+        response = await self._client.aio.models.generate_content(
+            model=self._background_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=max(900, self._max_output_tokens),
+                response_mime_type="application/json",
+            ),
+        )
+        logger.info(
+            "llm_request provider=google model=%s operation=reflection "
+            "status=ok duration_ms=%d",
+            self._background_model,
+            _duration_ms(started),
+        )
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.removeprefix("```json").removeprefix("```")
+            raw = raw.removesuffix("```").strip()
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise RuntimeError("Фоновая рефлексия вернула не объект")
+        return result
+
     async def embed_query(self, text: str) -> list[float]:
         return await self._embed(f"task: search result | query: {text}")
 
     async def embed_document(self, text: str, *, title: str) -> list[float]:
         return await self._embed(f"title: {title} | text: {text}")
 
+    async def embed_documents(
+        self, documents: list[tuple[str, str]]
+    ) -> list[list[float]]:
+        return await self._embed_many(
+            [f"title: {title} | text: {text}" for title, text in documents]
+        )
+
     async def _embed(self, text: str) -> list[float]:
+        return (await self._embed_many([text]))[0]
+
+    async def _embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
         if monotonic() < self._google_embedding_disabled_until:
-            return [0.0] * 768
+            return [[0.0] * 768 for _ in texts]
         try:
             result = await self._client.aio.models.embed_content(
                 model=self._embedding_model,
-                contents=text,
+                contents=texts,
                 config=types.EmbedContentConfig(output_dimensionality=768),
             )
         except Exception as error:
@@ -788,11 +859,14 @@ class GeminiAssistant:
                 logger.warning(
                     "Google embedding quota exhausted; lexical search enabled for 1h"
                 )
-                return [0.0] * 768
+                return [[0.0] * 768 for _ in texts]
             raise
-        if not result.embeddings or not result.embeddings[0].values:
+        if not result.embeddings or len(result.embeddings) != len(texts):
             raise RuntimeError("Gemini вернул пустой embedding")
-        return list(result.embeddings[0].values)
+        embeddings = [list(item.values or []) for item in result.embeddings]
+        if any(not item for item in embeddings):
+            raise RuntimeError("Gemini вернул пустой embedding")
+        return embeddings
 
 
 def _declaration(
@@ -863,7 +937,14 @@ def _build_group_tools() -> types.Tool:
             _declaration(
                 "search_memory",
                 "Гибридный поиск устойчивых фактов и локальных шуток этого чата.",
-                {"query": query, "limit": {"type": "integer", "minimum": 1, "maximum": 10}},
+                {
+                    "query": query,
+                    "kind": {
+                        "type": "string",
+                        "enum": ["any", "fact", "event", "joke", "preference", "decision"],
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
                 ["query"],
             ),
             _declaration(
@@ -1001,6 +1082,10 @@ def _build_group_tools() -> types.Tool:
                 {
                     "fact": {"type": "string"},
                     "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "event", "joke", "preference", "decision"],
+                    },
                 },
                 ["fact", "importance"],
             ),

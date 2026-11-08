@@ -38,6 +38,7 @@ class MemoryItem:
     text: str
     embedding: list[float]
     importance: float
+    kind: str = "fact"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,16 @@ class UserProfileFact:
     value: str
 
 
+@dataclass(frozen=True, slots=True)
+class MediaItem:
+    id: int
+    kind: str
+    file_id: str
+    description: str
+    embedding: list[float]
+    use_count: int
+
+
 class MessageStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
@@ -138,6 +149,7 @@ class MessageStore:
                 text TEXT NOT NULL,
                 embedding BLOB NOT NULL,
                 importance REAL NOT NULL DEFAULT 0.5,
+                kind TEXT NOT NULL DEFAULT 'fact',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_used_at TEXT,
                 UNIQUE (chat_id, text)
@@ -225,6 +237,9 @@ class MessageStore:
                 description TEXT NOT NULL,
                 source_chat INTEGER NOT NULL,
                 source_message INTEGER NOT NULL,
+                embedding BLOB,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(scope_chat, unique_id)
             );
@@ -241,6 +256,26 @@ class MessageStore:
                 value TEXT NOT NULL,
                 public INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS chat_summary_state (
+                chat_id INTEGER PRIMARY KEY,
+                last_event_id INTEGER NOT NULL DEFAULT 0,
+                snapshot TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_summary_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                start_event_id INTEGER NOT NULL,
+                end_event_id INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, start_event_id, end_event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_summary_segments_chat
+            ON chat_summary_segments(chat_id, end_event_id DESC);
             """
         )
         await self._ensure_schema_extensions()
@@ -281,6 +316,27 @@ class MessageStore:
             WHERE content_sha256 IS NOT NULL
             """
         )
+
+        cursor = await connection.execute("PRAGMA table_info(memories)")
+        memory_columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        if "kind" not in memory_columns:
+            await connection.execute(
+                "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"
+            )
+
+        cursor = await connection.execute("PRAGMA table_info(media_library)")
+        media_columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        for name, sql_type in (
+            ("embedding", "BLOB"),
+            ("use_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_used_at", "TEXT"),
+        ):
+            if name not in media_columns:
+                await connection.execute(
+                    f"ALTER TABLE media_library ADD COLUMN {name} {sql_type}"
+                )
 
         await connection.executescript(
             """
@@ -562,6 +618,74 @@ class MessageStore:
         await cursor.close()
         return [_chat_event_from_row(row) for row in reversed(rows)]
 
+    async def get_chat_summary(self, *, chat_id: int) -> str:
+        cursor = await self._require_connection().execute(
+            "SELECT snapshot FROM chat_summary_state WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return str(row[0]) if row else ""
+
+    async def get_unsummarized_chat_events(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+    ) -> list[tuple[int, ChatEvent]]:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT e.id, e.telegram_message_id, e.sender_id, e.sender_name,
+                   e.text, e.reply_to_message_id, e.role, e.file_id,
+                   e.file_name, e.mime_type, e.file_size, e.reply_text,
+                   e.reply_sender, e.created_at, e.media_kind,
+                   e.media_file_id, e.media_unique_id
+            FROM chat_events AS e
+            LEFT JOIN chat_summary_state AS s ON s.chat_id = e.chat_id
+            WHERE e.chat_id = ? AND e.id > COALESCE(s.last_event_id, 0)
+            ORDER BY e.id
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [(int(row[0]), _chat_event_from_row(row[1:])) for row in rows]
+
+    async def complete_summary_chunk(
+        self,
+        *,
+        chat_id: int,
+        start_event_id: int,
+        end_event_id: int,
+        segment: str,
+        snapshot: str,
+    ) -> None:
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO chat_summary_segments(
+                    chat_id, start_event_id, end_event_id, summary
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, start_event_id, end_event_id, segment[:5000]),
+            )
+            await connection.execute(
+                """
+                INSERT INTO chat_summary_state(chat_id, last_event_id, snapshot)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    last_event_id = MAX(chat_summary_state.last_event_id, excluded.last_event_id),
+                    snapshot = CASE
+                        WHEN excluded.last_event_id >= chat_summary_state.last_event_id
+                        THEN excluded.snapshot ELSE chat_summary_state.snapshot END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, end_event_id, snapshot[:6000]),
+            )
+            await connection.commit()
+
     async def get_chat_event(self, *, chat_id: int, message_id: int) -> ChatEvent | None:
         cursor = await self._require_connection().execute(
             """
@@ -630,18 +754,20 @@ class MessageStore:
         text: str,
         embedding: list[float],
         importance: float,
+        kind: str = "fact",
     ) -> None:
         connection = self._require_connection()
         async with self._write_lock:
             await connection.execute(
                 """
-                INSERT INTO memories (chat_id, text, embedding, importance)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO memories (chat_id, text, embedding, importance, kind)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, text) DO UPDATE SET
                     embedding = excluded.embedding,
-                    importance = MAX(memories.importance, excluded.importance)
+                    importance = MAX(memories.importance, excluded.importance),
+                    kind = excluded.kind
                 """,
-                (chat_id, text, _pack_embedding(embedding), importance),
+                (chat_id, text, _pack_embedding(embedding), importance, kind[:30]),
             )
             await connection.commit()
 
@@ -649,23 +775,24 @@ class MessageStore:
         self,
         *,
         chat_id: int,
+        kind: str = "any",
         limit: int = 250,
     ) -> list[MemoryItem]:
         connection = self._require_connection()
         cursor = await connection.execute(
             """
-            SELECT id, text, embedding, importance
+            SELECT id, text, embedding, importance, kind
             FROM memories
-            WHERE chat_id = ?
+            WHERE chat_id = ? AND (? = 'any' OR kind = ?)
             ORDER BY id DESC
             LIMIT ?
             """,
-            (chat_id, limit),
+            (chat_id, kind, kind, limit),
         )
         rows = await cursor.fetchall()
         await cursor.close()
         return [
-            MemoryItem(row[0], row[1], _unpack_embedding(row[2]), row[3])
+            MemoryItem(row[0], row[1], _unpack_embedding(row[2]), row[3], row[4])
             for row in rows
         ]
 
@@ -1241,46 +1368,132 @@ class MessageStore:
             await connection.execute("DELETE FROM chat_events WHERE chat_id = ?", (chat_id,))
             await connection.execute("DELETE FROM memories WHERE chat_id = ?", (chat_id,))
             await connection.execute("DELETE FROM attachment_cache WHERE chat_id = ?", (chat_id,))
+            await connection.execute("DELETE FROM chat_summary_segments WHERE chat_id = ?", (chat_id,))
+            await connection.execute("DELETE FROM chat_summary_state WHERE chat_id = ?", (chat_id,))
             await connection.commit()
 
     async def save_media(self, *, scope_chat: int, kind: str, file_id: str, unique_id: str,
-                         description: str, source_chat: int, source_message: int) -> int:
+                         description: str, source_chat: int, source_message: int,
+                         embedding: list[float] | None = None) -> int:
         connection = self._require_connection()
         async with self._write_lock:
             cursor = await connection.execute(
-                """INSERT INTO media_library(scope_chat,kind,file_id,unique_id,description,source_chat,source_message)
-                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(scope_chat,unique_id) DO UPDATE SET
-                   file_id=excluded.file_id, description=excluded.description RETURNING id""",
-                (scope_chat, kind, file_id, unique_id or file_id, description[:2000], source_chat, source_message),
+                """INSERT INTO media_library(
+                       scope_chat,kind,file_id,unique_id,description,source_chat,
+                       source_message,embedding
+                   ) VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(scope_chat,unique_id) DO UPDATE SET
+                       file_id=excluded.file_id,
+                       description=excluded.description,
+                       embedding=COALESCE(excluded.embedding, media_library.embedding)
+                   RETURNING id""",
+                (
+                    scope_chat, kind, file_id, unique_id or file_id,
+                    description[:2000], source_chat, source_message,
+                    _pack_embedding(embedding) if embedding else None,
+                ),
             )
             row = await cursor.fetchone()
             await cursor.close()
             await connection.commit()
             return int(row[0])
 
-    async def search_media(self, *, chat_id: int, query: str, kind: str = "any") -> list[dict]:
+    async def search_media_ids(
+        self, *, chat_id: int, query: str, kind: str = "any", limit: int = 60
+    ) -> set[int]:
         fts = _fts_query(query)
         if not fts:
-            if not query.strip():
-                return []
-            cursor = await self._require_connection().execute(
-                """SELECT id,kind,description FROM media_library WHERE scope_chat IN (0,?)
-                   AND (?='any' OR kind=?) AND instr(description,?)>0 ORDER BY id DESC LIMIT 8""",
-                (chat_id, kind, kind, query.strip()),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [{"media_id": row[0], "kind": row[1], "description": row[2]} for row in rows]
+            return set()
         cursor = await self._require_connection().execute(
-            """SELECT m.id,m.kind,m.description FROM media_library_fts
+            """SELECT m.id FROM media_library_fts
                JOIN media_library m ON m.id=media_library_fts.rowid
                WHERE media_library_fts MATCH ? AND m.scope_chat IN (0,?)
-               AND (?='any' OR m.kind=?) ORDER BY bm25(media_library_fts) LIMIT 8""",
-            (fts, chat_id, kind, kind),
+               AND (?='any' OR m.kind=?) ORDER BY bm25(media_library_fts) LIMIT ?""",
+            (fts, chat_id, kind, kind, limit),
         )
         rows = await cursor.fetchall()
         await cursor.close()
-        return [{"media_id": row[0], "kind": row[1], "description": row[2]} for row in rows]
+        return {int(row[0]) for row in rows}
+
+    async def get_media_candidates(
+        self, *, chat_id: int, kind: str = "any", limit: int = 500
+    ) -> list[MediaItem]:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT id, kind, file_id, description, embedding, use_count
+            FROM media_library
+            WHERE scope_chat IN (0, ?) AND (? = 'any' OR kind = ?)
+            ORDER BY id DESC LIMIT ?
+            """,
+            (chat_id, kind, kind, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [
+            MediaItem(
+                int(row[0]), str(row[1]), str(row[2]), str(row[3]),
+                _unpack_embedding(row[4]) if row[4] else [], int(row[5] or 0),
+            )
+            for row in rows
+        ]
+
+    async def get_media_without_embeddings(
+        self, *, chat_id: int, limit: int = 12
+    ) -> list[MediaItem]:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT id, kind, file_id, description, embedding, use_count
+            FROM media_library
+            WHERE scope_chat IN (0, ?) AND embedding IS NULL
+            ORDER BY id LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [
+            MediaItem(
+                int(row[0]), str(row[1]), str(row[2]), str(row[3]),
+                [], int(row[5] or 0),
+            )
+            for row in rows
+        ]
+
+    async def set_media_embedding(
+        self, *, media_id: int, embedding: list[float]
+    ) -> None:
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                "UPDATE media_library SET embedding = ? WHERE id = ?",
+                (_pack_embedding(embedding), media_id),
+            )
+            await connection.commit()
+
+    async def search_media(
+        self, *, chat_id: int, query: str, kind: str = "any"
+    ) -> list[dict]:
+        candidates = await self.get_media_candidates(
+            chat_id=chat_id, kind=kind, limit=500
+        )
+        fts_ids = await self.search_media_ids(
+            chat_id=chat_id, query=query, kind=kind, limit=60
+        )
+        needle = query.strip().casefold()
+        matches = [
+            item
+            for item in candidates
+            if item.id in fts_ids
+            or (needle and needle in item.description.casefold())
+        ][:8]
+        return [
+            {
+                "media_id": item.id,
+                "kind": item.kind,
+                "description": item.description,
+            }
+            for item in matches
+        ]
 
     async def get_media(self, *, chat_id: int, media_id: int) -> dict | None:
         cursor = await self._require_connection().execute(
@@ -1290,6 +1503,17 @@ class MessageStore:
         row = await cursor.fetchone()
         await cursor.close()
         return dict(zip(("id", "kind", "file_id", "description"), row)) if row else None
+
+    async def touch_media(self, media_id: int) -> None:
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """UPDATE media_library
+                   SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (media_id,),
+            )
+            await connection.commit()
 
     async def set_creator_note(self, *, key: str, value: str, public: bool = False) -> None:
         async with self._write_lock:
