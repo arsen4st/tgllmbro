@@ -71,12 +71,15 @@ def build_router(
             f"@{bot_username} или ответь на моё сообщение.\n"
             "/reset — владелец удаляет историю и память текущего чата.\n"
             "/addmeme описание — ответом на картинку добавить мем в базу.\n"
+            "/addmlbbmeme описание — добавить MLBB-мем с отдельным поисковым тегом.\n"
             "/addsticker описание — ответом на стикер добавить его в базу.\n"
             "/addsound описание — ответом на войс или аудио добавить звуковой мем.\n"
             "/gif, /pic, /sound, /sticker запрос — найти и отправить медиа.\n"
+            "/mlbbmeme запрос — найти MLBB-мем локально или через публичный поиск.\n"
             "/save название — сохранить вложение из reply (только владелец).\n"
             "/pack ссылка — добавить стикерпак для этого чата (только владелец).\n"
             "/creator — история создания.\n"
+            "/mediametrics — качество единого поиска по последним 500 запросам.\n"
             "/addmlbb заголовок | факт | ссылка — добавить проверенный факт по MLBB."
         )
 
@@ -88,7 +91,20 @@ def build_router(
         await store.clear_history(chat_id=message.chat.id, user_id=context_id)
         await message.answer("Контекст и долговременная память этого чата стёрты.")
 
-    @router.message(Command("addmeme"))
+    @router.message(Command("mediametrics"))
+    async def media_metrics(message: Message) -> None:
+        if message.from_user is None or message.from_user.id != owner_telegram_id:
+            return
+        metrics = await store.get_media_search_metrics(chat_id=message.chat.id)
+        await message.answer(
+            "media retrieval: "
+            f"searches={metrics['searches']}, selected={metrics['selected']}, "
+            f"selection_rate={metrics['selection_rate']}, "
+            f"MRR={metrics['mean_reciprocal_rank']}, "
+            f"sent={metrics['successful_sends']}, failed={metrics['failed_sends']}"
+        )
+
+    @router.message(Command("addmeme", "addmlbbmeme"))
     async def add_meme(message: Message) -> None:
         if message.from_user is None or message.from_user.id != owner_telegram_id:
             return
@@ -99,18 +115,26 @@ def build_router(
             )
             return
         description = (message.text or "").partition(" ")[2].strip()
+        is_mlbb = (message.text or "").split("@", 1)[0].casefold().startswith(
+            "/addmlbbmeme"
+        )
         if not description:
             description = (source.caption or "").strip()
         if not description:
             description = await _describe_for_library(message, source, group_agent)
             if not description:
                 return
+        if is_mlbb and not description.startswith("[MLBB]"):
+            description = "[MLBB] " + description
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             await group_agent.add_meme(
                 file_id=source.photo[-1].file_id,
                 description=description,
             )
-        await message.answer("Мем добавлен в базу. Теперь есть чем позориться.")
+        await message.answer(
+            "MLBB-мем добавлен в общий индекс." if is_mlbb
+            else "Мем добавлен в базу. Теперь есть чем позориться."
+        )
 
     @router.message(Command("addsticker"))
     async def add_sticker(message: Message) -> None:
@@ -191,13 +215,13 @@ def build_router(
             )
         await message.answer("Факт по MLBB записан. Теперь хотя бы не из воздуха.")
 
-    @router.message(Command("pic", "gif", "sound", "sticker", "save", "creator", "pack"))
+    @router.message(Command("pic", "gif", "sound", "sticker", "mlbbmeme", "save", "creator", "pack"))
     async def media_command(message: Message) -> None:
         if not private_access_allowed(message):
             return
         command, _, query = (message.text or "").partition(" ")
         name = command.split("@")[0].lstrip("/")
-        if name in {"pic", "gif", "sound", "sticker"} and not query.strip():
+        if name in {"pic", "gif", "sound", "sticker", "mlbbmeme"} and not query.strip():
             await message.answer(f"напиши, что искать: /{name} кот")
             return
         if name == "pack":
@@ -208,6 +232,7 @@ def build_router(
             return
         phrases = {"pic": "найди и отправь картинку ", "gif": "найди и отправь гифку ",
                    "sound": "найди и отправь звуковой мем ", "sticker": "найди и отправь стикер ",
+                   "mlbbmeme": "найди и отправь MLBB-мем по смыслу ",
                    "save": "сохрани ", "creator": "расскажи историю своего создателя "}
         payload = "название — " + query if name == "save" and query.strip() else query
         event = replace(_event_from_message(message), text=phrases[name] + payload, directed_to_bot=True)

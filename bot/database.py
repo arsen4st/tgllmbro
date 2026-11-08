@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,17 @@ class MediaItem:
     description: str
     embedding: list[float]
     use_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class UnifiedMediaItem:
+    ref: str
+    kind: str
+    file_id: str
+    description: str
+    embedding: list[float]
+    use_count: int
+    failure_count: int
 
 
 class MessageStore:
@@ -276,6 +288,28 @@ class MessageStore:
 
             CREATE INDEX IF NOT EXISTS idx_summary_segments_chat
             ON chat_summary_segments(chat_id, end_event_id DESC);
+
+            CREATE TABLE IF NOT EXISTS media_usage (
+                chat_id INTEGER NOT NULL,
+                media_ref TEXT NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                PRIMARY KEY(chat_id, media_ref)
+            );
+
+            CREATE TABLE IF NOT EXISTS media_search_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                result_refs TEXT NOT NULL,
+                selected_ref TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_media_search_log_chat
+            ON media_search_log(chat_id, id DESC);
             """
         )
         await self._ensure_schema_extensions()
@@ -1436,6 +1470,205 @@ class MessageStore:
             )
             for row in rows
         ]
+
+    async def get_unified_media_candidates(
+        self, *, chat_id: int, kind: str = "any", limit: int = 1000
+    ) -> list[UnifiedMediaItem]:
+        connection = self._require_connection()
+        per_source = max(100, limit // 4)
+        cursor = await connection.execute(
+            """
+            WITH
+            library_rows AS (
+                SELECT id, kind, file_id, description, embedding, use_count
+                FROM media_library WHERE scope_chat IN (0, ?)
+                ORDER BY id DESC LIMIT ?
+            ),
+            meme_rows AS (
+                SELECT id, file_id, description, embedding
+                FROM memes WHERE enabled = 1 ORDER BY id DESC LIMIT ?
+            ),
+            sound_rows AS (
+                SELECT id, media_kind, file_id, description, embedding
+                FROM sounds WHERE enabled = 1 ORDER BY id DESC LIMIT ?
+            ),
+            sticker_rows AS (
+                SELECT id, file_id, description, emoji, embedding
+                FROM stickers WHERE enabled = 1 ORDER BY id DESC LIMIT ?
+            )
+            SELECT source, source_id, kind, file_id, description, embedding,
+                   base_use_count
+            FROM (
+                SELECT 'library' AS source, id AS source_id, kind, file_id,
+                       description, embedding, use_count AS base_use_count
+                FROM library_rows
+                UNION ALL
+                SELECT 'meme', id, 'photo', file_id, description, embedding, 0
+                FROM meme_rows
+                UNION ALL
+                SELECT 'sound', id, media_kind, file_id, description, embedding, 0
+                FROM sound_rows
+                UNION ALL
+                SELECT 'sticker', id, 'sticker', file_id,
+                       TRIM(COALESCE(emoji, '') || ' ' || description), embedding, 0
+                FROM sticker_rows
+            )
+            WHERE (? = 'any' OR kind = ?)
+            """,
+            (
+                chat_id,
+                per_source,
+                per_source,
+                per_source,
+                per_source,
+                kind,
+                kind,
+            ),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        refs = [f"{row[0]}:{row[1]}" for row in rows]
+        usage: dict[str, tuple[int, int]] = {}
+        if refs:
+            placeholders = ",".join("?" for _ in refs)
+            cursor = await connection.execute(
+                f"SELECT media_ref, use_count, failure_count FROM media_usage WHERE chat_id = ? AND media_ref IN ({placeholders})",
+                [chat_id, *refs],
+            )
+            usage = {
+                str(row[0]): (int(row[1]), int(row[2]))
+                for row in await cursor.fetchall()
+            }
+            await cursor.close()
+        return [
+            UnifiedMediaItem(
+                ref=f"{row[0]}:{row[1]}",
+                kind=str(row[2]),
+                file_id=str(row[3]),
+                description=str(row[4]),
+                embedding=_unpack_embedding(row[5]) if row[5] else [],
+                use_count=int(row[6] or 0) + usage.get(f"{row[0]}:{row[1]}", (0, 0))[0],
+                failure_count=usage.get(f"{row[0]}:{row[1]}", (0, 0))[1],
+            )
+            for row in rows
+        ]
+
+    async def get_unified_media(
+        self, *, chat_id: int, media_ref: str
+    ) -> UnifiedMediaItem | None:
+        candidates = await self.get_unified_media_candidates(
+            chat_id=chat_id, limit=2000
+        )
+        return next((item for item in candidates if item.ref == media_ref), None)
+
+    async def search_unified_media_refs(
+        self, *, chat_id: int, query: str, kind: str = "any"
+    ) -> set[str]:
+        refs: set[str] = set()
+        if kind in {"any", "photo", "animation", "sticker", "voice", "audio", "video", "video_note", "document"}:
+            refs.update(
+                f"library:{item_id}"
+                for item_id in await self.search_media_ids(
+                    chat_id=chat_id, query=query, kind=kind
+                )
+            )
+        if kind in {"any", "photo"}:
+            refs.update(
+                f"meme:{item_id}"
+                for item_id in await self.search_meme_ids(query=query)
+            )
+        if kind in {"any", "voice", "audio"}:
+            refs.update(
+                f"sound:{item_id}"
+                for item_id in await self.search_sound_ids(query=query)
+            )
+        return refs
+
+    async def log_media_search(
+        self,
+        *,
+        chat_id: int,
+        query: str,
+        kind: str,
+        result_refs: list[str],
+    ) -> int:
+        connection = self._require_connection()
+        async with self._write_lock:
+            cursor = await connection.execute(
+                """INSERT INTO media_search_log(chat_id, query, kind, result_refs)
+                   VALUES (?, ?, ?, ?) RETURNING id""",
+                (chat_id, query[:500], kind[:30], json.dumps(result_refs)),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            await connection.commit()
+            return int(row[0])
+
+    async def record_media_result(
+        self,
+        *,
+        chat_id: int,
+        media_ref: str,
+        search_id: int | None,
+        success: bool,
+    ) -> None:
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """
+                INSERT INTO media_usage(chat_id, media_ref, use_count, failure_count, last_used_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, media_ref) DO UPDATE SET
+                    use_count = media_usage.use_count + excluded.use_count,
+                    failure_count = media_usage.failure_count + excluded.failure_count,
+                    last_used_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, media_ref, int(success), int(not success)),
+            )
+            if search_id is not None and success:
+                await connection.execute(
+                    """UPDATE media_search_log SET selected_ref = ?
+                       WHERE id = ? AND chat_id = ?""",
+                    (media_ref, search_id, chat_id),
+                )
+            await connection.commit()
+
+    async def get_media_search_metrics(self, *, chat_id: int) -> dict[str, object]:
+        cursor = await self._require_connection().execute(
+            """SELECT result_refs, selected_ref FROM media_search_log
+               WHERE chat_id = ? ORDER BY id DESC LIMIT 500""",
+            (chat_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        selected = 0
+        reciprocal_rank = 0.0
+        for raw_refs, selected_ref in rows:
+            if not selected_ref:
+                continue
+            selected += 1
+            try:
+                refs = json.loads(raw_refs)
+                rank = refs.index(selected_ref) + 1
+            except (ValueError, TypeError, json.JSONDecodeError):
+                continue
+            reciprocal_rank += 1.0 / rank
+        cursor = await self._require_connection().execute(
+            """SELECT COALESCE(SUM(use_count),0), COALESCE(SUM(failure_count),0)
+               FROM media_usage WHERE chat_id = ?""",
+            (chat_id,),
+        )
+        usage = await cursor.fetchone()
+        await cursor.close()
+        searches = len(rows)
+        return {
+            "searches": searches,
+            "selected": selected,
+            "selection_rate": round(selected / searches, 3) if searches else 0.0,
+            "mean_reciprocal_rank": round(reciprocal_rank / selected, 3) if selected else 0.0,
+            "successful_sends": int(usage[0] if usage else 0),
+            "failed_sends": int(usage[1] if usage else 0),
+        }
 
     async def get_media_without_embeddings(
         self, *, chat_id: int, limit: int = 12

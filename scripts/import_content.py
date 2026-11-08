@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("path", type=Path, help="Файл или папка для импорта")
     parser.add_argument(
         "--mode",
-        choices=("auto", "memes", "style", "knowledge"),
+        choices=("auto", "memes", "mlbb-memes", "style", "knowledge"),
         default="auto",
         help="Тип контента; auto определяет его по расширению",
     )
@@ -97,6 +97,7 @@ async def import_image(
     path: Path,
     store: MessageStore,
     assistant: GeminiAssistant,
+    mlbb: bool = False,
 ) -> bool:
     resolved = path.resolve()
     file_ref = f"local:{resolved}"
@@ -115,8 +116,18 @@ async def import_image(
         data=data,
         mime_type=mime_type,
         file_name=path.name,
+        context=(
+            "Это мем по Mobile Legends: Bang Bang. Назови узнаваемых героев, "
+            "роль/линию или игровой момент только если они реально видны; "
+            "добавь поисковые формулировки для эмоции и ситуации реакции."
+            if mlbb else ""
+        ),
     )
-    embedding = await assistant.embed_document(description, title=f"meme {path.name}")
+    if mlbb:
+        description = "[MLBB] " + description
+    embedding = await assistant.embed_document(
+        description, title=f"{'MLBB ' if mlbb else ''}meme {path.name}"
+    )
     await store.add_meme(
         file_id=file_ref,
         description=description,
@@ -304,7 +315,7 @@ async def run(args: argparse.Namespace) -> None:
                 break
             suffix = path.suffix.casefold()
             mode = args.mode
-            is_image = suffix in IMAGE_SUFFIXES and mode in {"auto", "memes"}
+            is_image = suffix in IMAGE_SUFFIXES and mode in {"auto", "memes", "mlbb-memes"}
             is_style = suffix in TEXT_SUFFIXES | {".json"} and mode in {"auto", "style"}
             is_knowledge = suffix in TEXT_SUFFIXES and mode == "knowledge"
             if not is_image and not is_style and not is_knowledge:
@@ -313,7 +324,12 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 if is_image:
                     imported += int(
-                        await import_image(path=path, store=store, assistant=assistant)
+                        await import_image(
+                            path=path,
+                            store=store,
+                            assistant=assistant,
+                            mlbb=mode == "mlbb-memes",
+                        )
                     )
                 elif is_knowledge:
                     imported += await import_knowledge_file(

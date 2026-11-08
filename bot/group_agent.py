@@ -35,10 +35,12 @@ from bot.database import (
     StickerItem,
     StyleExample,
     UserProfileFact,
+    UnifiedMediaItem,
 )
 from bot.gemini import AgentAction, GeminiAssistant
 from bot.web_reader import read_public_url
 from bot.media_search import search_public_media, download_public_media
+from bot.mlbb_live import search_mlbb_live
 
 
 logger = logging.getLogger(__name__)
@@ -467,6 +469,7 @@ class GroupAgent:
             "search_memory",
             "search_archive",
             "search_mlbb_knowledge",
+            "search_mlbb_live",
             "search_web",
             "get_creator_history",
         }
@@ -484,18 +487,6 @@ class GroupAgent:
         if conversational and VOICE_REQUEST_RE.search(rendered_messages):
             tools.add("speak_to_message")
 
-        if conversational:
-            has_memes, has_sounds, has_stickers = await asyncio.gather(
-                self._store.has_memes(),
-                self._store.has_sounds(),
-                self._store.has_stickers(),
-            )
-            if has_memes:
-                tools.update({"search_memes", "send_meme"})
-            if has_sounds:
-                tools.update({"search_sounds", "send_sound"})
-            if has_stickers:
-                tools.update({"search_stickers", "send_sticker"})
         return tools
 
     async def add_meme(self, *, file_id: str, description: str) -> None:
@@ -702,11 +693,18 @@ class GroupAgent:
             query = _required_text(action, "query")
             kind = str(action.arguments.get("kind", "any"))
             items = await self._find_media(batch.chat_id, query, kind, 8)
+            search_id = await self._store.log_media_search(
+                chat_id=batch.chat_id,
+                query=query,
+                kind=kind,
+                result_refs=[item.ref for item in items],
+            )
             return {
                 "ok": True,
+                "search_id": search_id,
                 "results": [
                     {
-                        "media_id": item.id,
+                        "media_ref": item.ref,
                         "kind": item.kind,
                         "description": item.description,
                     }
@@ -828,6 +826,9 @@ class GroupAgent:
                 ],
             }
 
+        if action.name == "search_mlbb_live":
+            return await search_mlbb_live(_required_text(action, "query"))
+
         if action.name == "search_web":
             query = _required_text(action, "query")
             return await self._assistant.search_web(query)
@@ -902,15 +903,15 @@ class GroupAgent:
 
     async def _find_media(
         self, chat_id: int, query: str, kind: str, limit: int
-    ) -> list[MediaItem]:
-        candidates = await self._store.get_media_candidates(
-            chat_id=chat_id, kind=kind, limit=500
+    ) -> list[UnifiedMediaItem]:
+        candidates = await self._store.get_unified_media_candidates(
+            chat_id=chat_id, kind=kind, limit=1000
         )
         if not candidates:
             return []
         embedding, fts_ids = await asyncio.gather(
             self._assistant.embed_query(query),
-            self._store.search_media_ids(
+            self._store.search_unified_media_refs(
                 chat_id=chat_id, query=query, kind=kind
             ),
         )
@@ -920,9 +921,18 @@ class GroupAgent:
             items=candidates,
             text_getter=lambda item: f"{item.kind} {item.description}",
             embedding_getter=lambda item: item.embedding,
-            importance_getter=lambda item: min(1.0, 0.5 + math.log1p(item.use_count) / 10),
+            importance_getter=lambda item: max(
+                0.0,
+                min(
+                    1.0,
+                    0.5
+                    + math.log1p(item.use_count) / 10
+                    - math.log1p(item.failure_count) / 8,
+                ),
+            ),
             limit=limit,
             fts_ids=fts_ids,
+            key_getter=lambda item: item.ref,
         )
 
     async def _find_sounds(self, query: str, limit: int) -> list[SoundItem]:
@@ -1233,13 +1243,24 @@ class GroupAgent:
                     target = _target_id(action, conversational_targets)
                     caption = str(action.arguments.get("caption", "")).strip()[:1000]
                     media_id = _optional_int(action.arguments.get("media_id"))
+                    media_ref = str(action.arguments.get("media_ref", "")).strip()
+                    search_id = _optional_int(action.arguments.get("search_id"))
                     web_id = str(action.arguments.get("web_id", "")).strip()
                     media = None
                     kind = description = ""
                     if target is not None:
-                        if bool(media_id) == bool(web_id):
+                        sources = int(bool(media_id)) + int(bool(media_ref)) + int(bool(web_id))
+                        if sources != 1:
                             raise ValueError("Нужен ровно один источник медиа")
-                        if media_id:
+                        if media_ref:
+                            saved_item = await self._store.get_unified_media(
+                                chat_id=batch.chat_id, media_ref=media_ref
+                            )
+                            if saved_item is not None:
+                                kind = saved_item.kind
+                                media = _meme_photo(saved_item.file_id)
+                                description = saved_item.description
+                        elif media_id:
                             saved = await self._store.get_media(chat_id=batch.chat_id, media_id=media_id)
                             if saved is not None:
                                 kind, media, description = saved["kind"], saved["file_id"], saved["description"]
@@ -1266,6 +1287,13 @@ class GroupAgent:
                             )
                             if media_id:
                                 await self._store.touch_media(media_id)
+                            if media_ref:
+                                await self._store.record_media_result(
+                                    chat_id=batch.chat_id,
+                                    media_ref=media_ref,
+                                    search_id=search_id,
+                                    success=True,
+                                )
                             limits["media"] += 1
 
                 elif action.name == "speak_to_message" and limits["voice"] < 1:
@@ -1346,6 +1374,15 @@ class GroupAgent:
                     action.name,
                     batch.chat_id,
                 )
+                if action.name == "send_media":
+                    media_ref = str(action.arguments.get("media_ref", "")).strip()
+                    if media_ref:
+                        await self._store.record_media_result(
+                            chat_id=batch.chat_id,
+                            media_ref=media_ref,
+                            search_id=_optional_int(action.arguments.get("search_id")),
+                            success=False,
+                        )
                 if action.name == "send_media":
                     target = _target_id(action, conversational_targets)
                     if target is not None:
@@ -1521,7 +1558,8 @@ def _hybrid_rank(
     embedding_getter: Callable[[T], list[float]],
     importance_getter: Callable[[T], float],
     limit: int,
-    fts_ids: set[int] | None = None,
+    fts_ids: set[object] | None = None,
+    key_getter: Callable[[T], object] | None = None,
 ) -> list[T]:
     query_tokens = _tokens(query)
     scored: list[tuple[float, T]] = []
@@ -1529,7 +1567,8 @@ def _hybrid_rank(
         semantic = _cosine(query_embedding, embedding_getter(item))
         lexical = _lexical_score(query_tokens, _tokens(text_getter(item)))
         importance = float(importance_getter(item))
-        fts_bonus = 0.1 if fts_ids and getattr(item, "id", None) in fts_ids else 0.0
+        item_key = key_getter(item) if key_getter else getattr(item, "id", None)
+        fts_bonus = 0.1 if fts_ids and item_key in fts_ids else 0.0
         scored.append(
             (0.62 * semantic + 0.23 * lexical + 0.05 * importance + fts_bonus, item)
         )

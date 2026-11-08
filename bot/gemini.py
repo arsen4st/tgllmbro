@@ -27,6 +27,7 @@ LOOKUP_TOOLS = {
     "search_sounds",
     "search_stickers",
     "search_mlbb_knowledge",
+    "search_mlbb_live",
     "search_web",
     "read_url",
     "read_attachment",
@@ -672,6 +673,7 @@ class GeminiAssistant:
         data: bytes,
         mime_type: str,
         file_name: str,
+        context: str = "",
     ) -> str:
         instruction = (
             "Опиши мем для смыслового поиска. Обязательно перепиши видимый текст "
@@ -679,6 +681,8 @@ class GeminiAssistant:
             "шутки и в каких репликах картинка уместна. Пиши по-русски, плотно, "
             "без вступлений и без выдуманных деталей."
         )
+        if context:
+            instruction += " Дополнительный контекст: " + context[:1000]
         if self._anymodel is not None:
             try:
                 return await self._inspect_image_openai(
@@ -925,12 +929,12 @@ def _build_group_tools() -> types.Tool:
     query = {"type": "string", "description": "короткий смысловой поисковый запрос"}
     return types.Tool(
         function_declarations=[
-            _declaration("search_media", "Найти сохранённое медиа этого чата или общей коллекции по описанию.",
+            _declaration("search_media", "Единый гибридный поиск по сохранённым GIF, мемам, картинкам, стикерам, звукам, видео и файлам. Возвращает media_ref и search_id.",
                 {"query": query, "kind": {"type": "string", "enum": ["any", "photo", "animation", "sticker", "voice", "audio", "video", "video_note", "document"]}}, ["query"]),
             _declaration("search_public_media", "Поиск GIF/картинок-реакций Tenor и звуков Myinstants. Не вызывает inline-ботов. Можно искать коротко по-английски.",
                 {"query": query, "kind": {"type": "string", "enum": ["photo", "animation", "voice"]}}, ["query", "kind"]),
-            _declaration("send_media", "Отправить найденное медиа: media_id из search_media ИЛИ web_id из search_public_media. Только один источник.",
-                {"target_message_id": target, "media_id": {"type": "integer"}, "web_id": {"type": "string"}, "caption": {"type": "string"}}, ["target_message_id"]),
+            _declaration("send_media", "Отправить найденное медиа: media_ref из search_media ИЛИ web_id из search_public_media. Передай search_id для метрики качества.",
+                {"target_message_id": target, "media_ref": {"type": "string"}, "media_id": {"type": "integer"}, "web_id": {"type": "string"}, "search_id": {"type": "integer"}, "caption": {"type": "string"}}, ["target_message_id"]),
             _declaration("save_media", "Сохранить вложение/цитату по явной команде владельца. Получить реальный результат перед подтверждением.",
                 {"target_message_id": target, "description": {"type": "string"}}, ["target_message_id"]),
             _declaration("get_creator_history", "Прочитать подтверждённую историю создания и доступные факты о владельце; вместо выдуманной биографии.", {}, []),
@@ -975,6 +979,12 @@ def _build_group_tools() -> types.Tool:
                 "search_mlbb_knowledge",
                 "Поиск по локальной проверенной базе знаний Mobile Legends: Bang Bang.",
                 {"query": query, "limit": {"type": "integer", "minimum": 1, "maximum": 8}},
+                ["query"],
+            ),
+            _declaration(
+                "search_mlbb_live",
+                "Живые MLBB-данные: Rone Arena API + MLBB.GG, с датой получения и ссылками. Для текущей меты, билдов, статистики и контрпиков. Патчноуты официального сайта приоритетнее community-данных.",
+                {"query": query},
                 ["query"],
             ),
             _declaration(
