@@ -1241,16 +1241,20 @@ class GroupAgent:
 
                 elif action.name == "send_media" and limits["media"] < 1:
                     target = _target_id(action, conversational_targets)
-                    caption = str(action.arguments.get("caption", "")).strip()[:1000]
+                    caption = str(action.arguments.get("caption") or "").strip()[:1000]
                     media_id = _optional_int(action.arguments.get("media_id"))
-                    media_ref = str(action.arguments.get("media_ref", "")).strip()
+                    media_ref = _media_source_text(action.arguments.get("media_ref"))
                     search_id = _optional_int(action.arguments.get("search_id"))
-                    web_id = str(action.arguments.get("web_id", "")).strip()
+                    web_id = _media_source_text(action.arguments.get("web_id"))
                     media = None
                     kind = description = ""
                     if target is not None:
                         sources = int(bool(media_id)) + int(bool(media_ref)) + int(bool(web_id))
                         if sources != 1:
+                            logger.warning(
+                                "Invalid media sources chat_id=%s media_id=%s media_ref=%s web_id=%s",
+                                batch.chat_id, bool(media_id), bool(media_ref), bool(web_id),
+                            )
                             raise ValueError("Нужен ровно один источник медиа")
                         if media_ref:
                             saved_item = await self._store.get_unified_media(
@@ -1375,7 +1379,7 @@ class GroupAgent:
                     batch.chat_id,
                 )
                 if action.name == "send_media":
-                    media_ref = str(action.arguments.get("media_ref", "")).strip()
+                    media_ref = _media_source_text(action.arguments.get("media_ref"))
                     if media_ref:
                         await self._store.record_media_result(
                             chat_id=batch.chat_id,
@@ -1386,7 +1390,7 @@ class GroupAgent:
                 if action.name == "send_media":
                     target = _target_id(action, conversational_targets)
                     if target is not None:
-                        await self._send_reply(batch.chat_id, target, "не получилось отправить этот файл. попробуй другой запрос")
+                        await self._send_reply(batch.chat_id, target, "не удалось отправить медиа: сбой выбора или загрузки файла")
 
     async def _send_media(self, chat_id: int, target: int, kind: str, media: str | BufferedInputFile, caption: str):
         reply = _reply_parameters(target)
@@ -1481,6 +1485,13 @@ def _render_style_examples(examples: Iterable[StyleExample]) -> str:
         response = example.response.replace("\n", " ").strip()[:1200]
         blocks.append(f"{index}. контекст: {context or '(нет)'}\nответ: {response}")
     return "\n\n".join(blocks)
+
+
+def _media_source_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return "" if value.casefold() in {"null", "none"} else value
 
 
 def _required_text(action: AgentAction, key: str) -> str:

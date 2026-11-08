@@ -933,7 +933,7 @@ def _build_group_tools() -> types.Tool:
                 {"query": query, "kind": {"type": "string", "enum": ["any", "photo", "animation", "sticker", "voice", "audio", "video", "video_note", "document"]}}, ["query"]),
             _declaration("search_public_media", "Поиск GIF/картинок-реакций Tenor и звуков Myinstants. Не вызывает inline-ботов. Можно искать коротко по-английски.",
                 {"query": query, "kind": {"type": "string", "enum": ["photo", "animation", "voice"]}}, ["query", "kind"]),
-            _declaration("send_media", "Отправить найденное медиа: media_ref из search_media ИЛИ web_id из search_public_media. Передай search_id для метрики качества.",
+            _declaration("send_media", "Отправить найденное медиа. Укажи ровно один источник: media_ref из search_media ИЛИ web_id из search_public_media ИЛИ legacy media_id. Остальные поля источников пропусти. Не выдумывай ID. search_id — только метрика локального поиска, не источник.",
                 {"target_message_id": target, "media_ref": {"type": "string"}, "media_id": {"type": "integer"}, "web_id": {"type": "string"}, "search_id": {"type": "integer"}, "caption": {"type": "string"}}, ["target_message_id"]),
             _declaration("save_media", "Сохранить вложение/цитату по явной команде владельца. Получить реальный результат перед подтверждением.",
                 {"target_message_id": target, "description": {"type": "string"}}, ["target_message_id"]),
