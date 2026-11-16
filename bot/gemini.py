@@ -12,12 +12,27 @@ from google import genai
 from google.genai import types
 from openai import APIStatusError, AsyncOpenAI
 
+from bot.antigravity import AntigravityClient
 from bot.web_search import search_public_web
 from bot.media import SpeechFallback, sample_video, wrap_pcm
 from bot.persona import GROUP_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 
 logger = logging.getLogger(__name__)
+
+VALID_PROVIDERS = ("auto", "antigravity", "anymodel", "openrouter", "google")
+VALID_SCOPES = ("dm", "group")
+PROVIDER_LABELS: dict[str, str] = {
+    "auto": "⚡ Авто-каскад",
+    "antigravity": "🟢 Antigravity",
+    "anymodel": "🔵 AnyModel",
+    "openrouter": "🟣 OpenRouter",
+    "google": "🔴 Google AI Studio",
+}
+SCOPE_LABELS: dict[str, str] = {
+    "dm": "👤 В личке",
+    "group": "👥 В общем",
+}
 
 
 LOOKUP_TOOLS = {
@@ -62,8 +77,18 @@ class GeminiAssistant:
         tts_voice: str,
         max_output_tokens: int,
         background_model: str | None = None,
+        antigravity_model: str = "gemini-3.8-flash-low",
+        antigravity_client: AntigravityClient | None = None,
     ) -> None:
         self._client = genai.Client(api_key=api_key)
+        self._antigravity = antigravity_client or AntigravityClient(
+            model=antigravity_model
+        )
+        self._antigravity_model = antigravity_model
+        self._selected_providers: dict[str, str] = {
+            "dm": "auto",
+            "group": "auto",
+        }
         self._anymodel = (
             AsyncOpenAI(
                 api_key=anymodel_api_key,
@@ -112,95 +137,185 @@ class GeminiAssistant:
             await self._openrouter.close()
         await self._client.aio.aclose()
 
+    def get_provider(self, scope: str) -> str:
+        normalized = scope if scope in VALID_SCOPES else "group"
+        return self._selected_providers.get(normalized, "auto")
+
+    def set_provider(self, scope: str, provider: str) -> None:
+        if scope not in VALID_SCOPES:
+            raise ValueError(f"Неизвестный режим области: {scope}")
+        if provider not in VALID_PROVIDERS:
+            raise ValueError(f"Неизвестный провайдер: {provider}")
+        self._selected_providers[scope] = provider
+
+    def provider_info(self, provider: str) -> tuple[str, str, bool]:
+        label = PROVIDER_LABELS.get(provider, provider)
+        if provider == "antigravity":
+            return label, self._antigravity_model, self._antigravity.is_available()
+        if provider == "anymodel":
+            return label, self._anymodel_model, self._anymodel is not None
+        if provider == "openrouter":
+            return label, self._openrouter_model, self._openrouter is not None
+        if provider == "google":
+            return label, self._model, True
+        return label, "каскад", True
+
+    def _provider_order(self, scope: str) -> list[str]:
+        selected = self.get_provider(scope)
+        default_chain = ["anymodel", "openrouter", "google"]
+        if selected == "auto":
+            return default_chain
+        return [selected] + [p for p in default_chain if p != selected]
+
     async def reply(
         self,
         *,
         history: list[tuple[str, str]],
         user_text: str,
+        scope: str = "dm",
     ) -> str:
-        if self._anymodel is not None:
-            started = perf_counter()
-            try:
-                answer = await self._reply_openai(
-                    client=self._anymodel,
-                    model=self._anymodel_model,
-                    history=history,
-                    user_text=user_text,
-                )
-                logger.info(
-                    "llm_request provider=anymodel model=%s operation=reply "
-                    "status=ok duration_ms=%d",
-                    self._anymodel_model,
-                    _duration_ms(started),
-                )
-                return answer
-            except Exception:
-                logger.exception(
-                    "llm_request provider=anymodel model=%s operation=reply "
-                    "status=error duration_ms=%d; falling back",
-                    self._anymodel_model,
-                    _duration_ms(started),
-                )
+        order = self._provider_order(scope)
+        last_error: Exception | None = None
+        for index, provider in enumerate(order):
+            is_last = index == len(order) - 1
+            if provider == "antigravity":
+                started = perf_counter()
+                try:
+                    answer = await self._antigravity.reply(
+                        system_prompt=SYSTEM_PROMPT,
+                        history=history,
+                        user_text=user_text,
+                    )
+                    logger.info(
+                        "llm_request provider=antigravity model=%s operation=reply "
+                        "status=ok duration_ms=%d",
+                        self._antigravity_model,
+                        _duration_ms(started),
+                    )
+                    return answer
+                except Exception as error:
+                    last_error = error
+                    logger.exception(
+                        "llm_request provider=antigravity model=%s operation=reply "
+                        "status=error duration_ms=%d; falling back",
+                        self._antigravity_model,
+                        _duration_ms(started),
+                    )
+                continue
 
-        if self._openrouter is not None:
-            started = perf_counter()
-            try:
-                answer = await self._reply_openai(
-                    client=self._openrouter,
-                    model=self._openrouter_model,
-                    history=history,
-                    user_text=user_text,
-                    extra_body={
-                        "provider": {
-                            "allow_fallbacks": True,
-                            "require_parameters": True,
-                        }
-                    },
-                )
-                logger.info(
-                    "llm_request provider=openrouter model=%s operation=reply "
-                    "status=ok duration_ms=%d",
-                    self._openrouter_model,
-                    _duration_ms(started),
-                )
-                return answer
-            except Exception as error:
-                if not _should_fallback_from_openrouter(error):
-                    raise
-                logger.exception(
-                    "llm_request provider=openrouter model=%s operation=reply "
-                    "status=error duration_ms=%d; falling back",
-                    self._openrouter_model,
-                    _duration_ms(started),
-                )
+            if provider == "anymodel":
+                if self._anymodel is None:
+                    continue
+                started = perf_counter()
+                try:
+                    answer = await self._reply_openai(
+                        client=self._anymodel,
+                        model=self._anymodel_model,
+                        history=history,
+                        user_text=user_text,
+                    )
+                    logger.info(
+                        "llm_request provider=anymodel model=%s operation=reply "
+                        "status=ok duration_ms=%d",
+                        self._anymodel_model,
+                        _duration_ms(started),
+                    )
+                    return answer
+                except Exception as error:
+                    last_error = error
+                    logger.exception(
+                        "llm_request provider=anymodel model=%s operation=reply "
+                        "status=error duration_ms=%d; falling back",
+                        self._anymodel_model,
+                        _duration_ms(started),
+                    )
+                continue
 
-        contents = [
-            types.Content(role=role, parts=[types.Part.from_text(text=content)])
-            for role, content in history
-        ]
-        contents.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
-        )
-        started = perf_counter()
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.9,
-                max_output_tokens=self._max_output_tokens,
-            ),
-        )
-        answer = (response.text or "").strip()
-        if not answer:
-            raise RuntimeError("Gemini вернул пустой ответ")
-        logger.info(
-            "llm_request provider=google model=%s operation=reply "
-            "status=ok duration_ms=%d",
-            self._model,
-            _duration_ms(started),
-        )
-        return answer
+            if provider == "openrouter":
+                if self._openrouter is None:
+                    continue
+                started = perf_counter()
+                try:
+                    answer = await self._reply_openai(
+                        client=self._openrouter,
+                        model=self._openrouter_model,
+                        history=history,
+                        user_text=user_text,
+                        extra_body={
+                            "provider": {
+                                "allow_fallbacks": True,
+                                "require_parameters": True,
+                            }
+                        },
+                    )
+                    logger.info(
+                        "llm_request provider=openrouter model=%s operation=reply "
+                        "status=ok duration_ms=%d",
+                        self._openrouter_model,
+                        _duration_ms(started),
+                    )
+                    return answer
+                except Exception as error:
+                    last_error = error
+                    if is_last and not _should_fallback_from_openrouter(error):
+                        raise
+                    if not _should_fallback_from_openrouter(error) and self.get_provider(scope) == "auto":
+                        raise
+                    logger.exception(
+                        "llm_request provider=openrouter model=%s operation=reply "
+                        "status=error duration_ms=%d; falling back",
+                        self._openrouter_model,
+                        _duration_ms(started),
+                    )
+                continue
+
+            if provider == "google":
+                started = perf_counter()
+                try:
+                    contents = [
+                        types.Content(
+                            role=role, parts=[types.Part.from_text(text=content)]
+                        )
+                        for role, content in history
+                    ]
+                    contents.append(
+                        types.Content(
+                            role="user", parts=[types.Part.from_text(text=user_text)]
+                        )
+                    )
+                    response = await self._client.aio.models.generate_content(
+                        model=self._model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.9,
+                            max_output_tokens=self._max_output_tokens,
+                        ),
+                    )
+                    answer = (response.text or "").strip()
+                    if not answer:
+                        raise RuntimeError("Gemini вернул пустой ответ")
+                    logger.info(
+                        "llm_request provider=google model=%s operation=reply "
+                        "status=ok duration_ms=%d",
+                        self._model,
+                        _duration_ms(started),
+                    )
+                    return answer
+                except Exception as error:
+                    last_error = error
+                    if is_last:
+                        raise
+                    logger.exception(
+                        "llm_request provider=google model=%s operation=reply "
+                        "status=error duration_ms=%d; falling back",
+                        self._model,
+                        _duration_ms(started),
+                    )
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Нет доступных провайдеров для ответа")
 
     async def _reply_openai(
         self,
@@ -245,83 +360,15 @@ class GeminiAssistant:
         style_examples: str,
         available_tools: set[str],
         tool_executor: ToolExecutor,
+        scope: str = "group",
     ) -> list[AgentAction]:
-        group_tools = types.Tool(
-            function_declarations=[
-                declaration
-                for name, declaration in self._group_tool_declarations.items()
-                if name in available_tools
-            ]
-        )
+        declarations = [
+            declaration
+            for name, declaration in self._group_tool_declarations.items()
+            if name in available_tools
+        ]
+        group_tools = types.Tool(function_declarations=declarations)
         openai_tools = _build_openrouter_tools(group_tools)
-        if self._anymodel is not None:
-            started = perf_counter()
-            try:
-                actions = await self._plan_group_actions_openai(
-                    client=self._anymodel,
-                    model=self._anymodel_model,
-                    recent_context=recent_context,
-                    summary_context=summary_context,
-                    user_profiles=user_profiles,
-                    new_messages=new_messages,
-                    style_examples=style_examples,
-                    openai_tools=openai_tools,
-                    tool_executor=tool_executor,
-                )
-                logger.info(
-                    "llm_request provider=anymodel model=%s operation=group "
-                    "status=ok duration_ms=%d actions=%d",
-                    self._anymodel_model,
-                    _duration_ms(started),
-                    len(actions),
-                )
-                return actions
-            except Exception:
-                logger.exception(
-                    "llm_request provider=anymodel model=%s operation=group "
-                    "status=error duration_ms=%d; falling back",
-                    self._anymodel_model,
-                    _duration_ms(started),
-                )
-
-        if self._openrouter is not None:
-            started = perf_counter()
-            try:
-                actions = await self._plan_group_actions_openai(
-                    client=self._openrouter,
-                    model=self._openrouter_model,
-                    recent_context=recent_context,
-                    summary_context=summary_context,
-                    user_profiles=user_profiles,
-                    new_messages=new_messages,
-                    style_examples=style_examples,
-                    openai_tools=openai_tools,
-                    tool_executor=tool_executor,
-                    extra_body={
-                        "provider": {
-                            "allow_fallbacks": True,
-                            "require_parameters": True,
-                        }
-                    },
-                )
-                logger.info(
-                    "llm_request provider=openrouter model=%s operation=group "
-                    "status=ok duration_ms=%d actions=%d",
-                    self._openrouter_model,
-                    _duration_ms(started),
-                    len(actions),
-                )
-                return actions
-            except Exception as error:
-                if not _should_fallback_from_openrouter(error):
-                    raise
-                logger.exception(
-                    "llm_request provider=openrouter model=%s operation=group "
-                    "status=error duration_ms=%d; falling back",
-                    self._openrouter_model,
-                    _duration_ms(started),
-                )
-
         prompt = (
             "НЕДАВНИЙ КОНТЕКСТ (только фон, отвечать можно лишь на новые id):\n"
             f"{recent_context or '(пусто)'}\n\n"
@@ -336,6 +383,148 @@ class GeminiAssistant:
             "Выбери действие. Если нужны данные — сначала вызови search/read. "
             "Иначе сразу вызови финальные Telegram-инструменты."
         )
+
+        order = self._provider_order(scope)
+        last_error: Exception | None = None
+        for index, provider in enumerate(order):
+            is_last = index == len(order) - 1
+            if provider == "antigravity":
+                started = perf_counter()
+                try:
+                    actions = await self._antigravity.plan_group_actions(
+                        system_prompt=GROUP_SYSTEM_PROMPT,
+                        prompt=prompt,
+                        declarations=declarations,
+                        lookup_tools=LOOKUP_TOOLS,
+                        tool_executor=tool_executor,
+                        action_factory=lambda name, args: AgentAction(
+                            name=name, arguments=args
+                        ),
+                    )
+                    logger.info(
+                        "llm_request provider=antigravity model=%s operation=group "
+                        "status=ok duration_ms=%d actions=%d",
+                        self._antigravity_model,
+                        _duration_ms(started),
+                        len(actions),
+                    )
+                    return actions
+                except Exception as error:
+                    last_error = error
+                    logger.exception(
+                        "llm_request provider=antigravity model=%s operation=group "
+                        "status=error duration_ms=%d; falling back",
+                        self._antigravity_model,
+                        _duration_ms(started),
+                    )
+                continue
+
+            if provider == "anymodel":
+                if self._anymodel is None:
+                    continue
+                started = perf_counter()
+                try:
+                    actions = await self._plan_group_actions_openai(
+                        client=self._anymodel,
+                        model=self._anymodel_model,
+                        recent_context=recent_context,
+                        summary_context=summary_context,
+                        user_profiles=user_profiles,
+                        new_messages=new_messages,
+                        style_examples=style_examples,
+                        openai_tools=openai_tools,
+                        tool_executor=tool_executor,
+                    )
+                    logger.info(
+                        "llm_request provider=anymodel model=%s operation=group "
+                        "status=ok duration_ms=%d actions=%d",
+                        self._anymodel_model,
+                        _duration_ms(started),
+                        len(actions),
+                    )
+                    return actions
+                except Exception as error:
+                    last_error = error
+                    logger.exception(
+                        "llm_request provider=anymodel model=%s operation=group "
+                        "status=error duration_ms=%d; falling back",
+                        self._anymodel_model,
+                        _duration_ms(started),
+                    )
+                continue
+
+            if provider == "openrouter":
+                if self._openrouter is None:
+                    continue
+                started = perf_counter()
+                try:
+                    actions = await self._plan_group_actions_openai(
+                        client=self._openrouter,
+                        model=self._openrouter_model,
+                        recent_context=recent_context,
+                        summary_context=summary_context,
+                        user_profiles=user_profiles,
+                        new_messages=new_messages,
+                        style_examples=style_examples,
+                        openai_tools=openai_tools,
+                        tool_executor=tool_executor,
+                        extra_body={
+                            "provider": {
+                                "allow_fallbacks": True,
+                                "require_parameters": True,
+                            }
+                        },
+                    )
+                    logger.info(
+                        "llm_request provider=openrouter model=%s operation=group "
+                        "status=ok duration_ms=%d actions=%d",
+                        self._openrouter_model,
+                        _duration_ms(started),
+                        len(actions),
+                    )
+                    return actions
+                except Exception as error:
+                    last_error = error
+                    if is_last and not _should_fallback_from_openrouter(error):
+                        raise
+                    if not _should_fallback_from_openrouter(error) and self.get_provider(scope) == "auto":
+                        raise
+                    logger.exception(
+                        "llm_request provider=openrouter model=%s operation=group "
+                        "status=error duration_ms=%d; falling back",
+                        self._openrouter_model,
+                        _duration_ms(started),
+                    )
+                continue
+
+            if provider == "google":
+                try:
+                    return await self._plan_group_actions_google(
+                        prompt=prompt,
+                        group_tools=group_tools,
+                        tool_executor=tool_executor,
+                    )
+                except Exception as error:
+                    last_error = error
+                    if is_last:
+                        raise
+                    logger.exception(
+                        "llm_request provider=google model=%s operation=group "
+                        "status=error; falling back",
+                        self._model,
+                    )
+
+        if last_error is not None:
+            raise last_error
+        return [AgentAction("stay_silent", {"reason": "no provider available"})]
+
+    async def _plan_group_actions_google(
+        self,
+        *,
+        prompt: str,
+        group_tools: types.Tool,
+        tool_executor: ToolExecutor,
+    ) -> list[AgentAction]:
         contents: list[types.Content] = [
             types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
         ]

@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher
 from bot.batcher import GroupBatcher
 from bot.config import Settings
 from bot.database import MessageStore
-from bot.gemini import GeminiAssistant
+from bot.gemini import VALID_PROVIDERS, GeminiAssistant
 from bot.group_agent import GroupAgent
 from bot.handlers import build_router
 
@@ -47,8 +47,15 @@ async def main() -> None:
         tts_model=settings.gemini_tts_model,
         tts_voice=settings.gemini_tts_voice,
         max_output_tokens=settings.max_output_tokens,
+        antigravity_model=settings.antigravity_model,
     )
     await store.connect()
+    for scope in ("dm", "group"):
+        saved_provider = await store.get_bot_setting(
+            f"provider_{scope}", default="auto"
+        )
+        if saved_provider in VALID_PROVIDERS:
+            assistant.set_provider(scope, saved_provider)
     group_batcher: GroupBatcher | None = None
     try:
         bot_info = await bot.get_me()

@@ -12,6 +12,7 @@ __pycache__/
 data/*.sqlite3
 data/*.sqlite3-*
 data/models/
+data/.antigravity_home/
 logs/
 *.log
 *.pid

@@ -269,6 +269,12 @@ class MessageStore:
                 public INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS chat_summary_state (
                 chat_id INTEGER PRIMARY KEY,
                 last_event_id INTEGER NOT NULL DEFAULT 0,
@@ -1763,6 +1769,28 @@ class MessageStore:
         rows = await cursor.fetchall()
         await cursor.close()
         return "\n".join(f"{key}: {value}" for key, value in rows)
+
+    async def get_bot_setting(self, key: str, default: str = "") -> str:
+        cursor = await self._require_connection().execute(
+            "SELECT value FROM bot_settings WHERE key = ?",
+            (key[:80],),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return str(row[0]) if row else default
+
+    async def set_bot_setting(self, key: str, value: str) -> None:
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO bot_settings (key, value, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (key[:80], value[:200]),
+            )
+            await connection.commit()
 
     def _require_connection(self) -> aiosqlite.Connection:
         if self._connection is None:

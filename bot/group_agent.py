@@ -374,6 +374,11 @@ class GroupAgent:
                 retrieved_memory_ids=retrieved_memory_ids,
             )
 
+        scope = (
+            "dm"
+            if self._owner_id and batch.chat_id == self._owner_id
+            else "group"
+        )
         actions = await self._assistant.plan_group_actions(
             recent_context=recent_context,
             summary_context=summary_context,
@@ -382,6 +387,7 @@ class GroupAgent:
             new_messages=rendered_new_messages,
             available_tools=available_tools,
             tool_executor=execute_lookup,
+            scope=scope,
         )
         await self._execute_actions(batch, actions)
         await self._store.touch_memories(list(retrieved_memory_ids))

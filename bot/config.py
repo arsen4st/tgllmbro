@@ -39,6 +39,7 @@ class Settings:
     profile_context_chars: int
     new_context_chars: int
     style_context_chars: int
+    antigravity_model: str = "gemini-3.8-flash-low"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,6 +137,9 @@ class Settings:
             style_context_chars=_positive_int(
                 "STYLE_CONTEXT_CHARS", default=3000
             ),
+            antigravity_model=os.getenv(
+                "ANTIGRAVITY_MODEL", "gemini-3.8-flash-low"
+            ).strip(),
         )
 
 

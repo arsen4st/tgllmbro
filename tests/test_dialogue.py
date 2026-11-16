@@ -13,9 +13,14 @@ from aiogram.types import Message
 
 from bot.batcher import MessageBatch
 from bot.database import ChatEvent, MessageStore
-from bot.gemini import AgentAction
+from bot.gemini import AgentAction, GeminiAssistant
 from bot.group_agent import GroupAgent, _render_events
-from bot.handlers import _attachment_metadata, _event_from_message, _handle_private_message
+from bot.handlers import (
+    _attachment_metadata,
+    _build_provider_menu,
+    _event_from_message,
+    _handle_private_message,
+)
 from bot.media import wrap_pcm
 
 
@@ -138,6 +143,84 @@ class MediaMetadataTests(unittest.TestCase):
             self.assertEqual(stream.getframerate(), 24000)
             self.assertEqual(stream.getnframes(), 240)
         self.assertEqual(wrap_pcm(b"ID3abc", "audio/mpeg"), b"ID3abc")
+
+
+class ProviderMenuAndRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.store = MessageStore(Path(self.directory.name) / "test.sqlite3")
+        await self.store.connect()
+
+    async def asyncTearDown(self):
+        await self.store.close()
+        self.directory.cleanup()
+
+    async def test_bot_settings_persist_dm_and_group_providers(self):
+        self.assertEqual(await self.store.get_bot_setting("provider_dm", "auto"), "auto")
+        await self.store.set_bot_setting("provider_dm", "antigravity")
+        await self.store.set_bot_setting("provider_group", "openrouter")
+        self.assertEqual(await self.store.get_bot_setting("provider_dm"), "antigravity")
+        self.assertEqual(await self.store.get_bot_setting("provider_group"), "openrouter")
+
+    async def test_two_level_menu_and_scope_routing(self):
+        fake_ag = SimpleNamespace(
+            is_available=lambda: True,
+            reply=AsyncMock(return_value="ответ с подписки"),
+            plan_group_actions=AsyncMock(
+                return_value=[AgentAction("reply_to_message", {"target_message_id": 10, "text": "из подписки"})]
+            ),
+        )
+        assistant = GeminiAssistant(
+            api_key="test-key",
+            anymodel_api_key="am-key",
+            anymodel_model="ag/gemini-3-flash",
+            openrouter_api_key="or-key",
+            openrouter_model="google/gemini-3.8-flash",
+            model="gemini-3.8-flash",
+            embedding_model="gemini-embedding-2",
+            tts_model="gemini-3.8-flash-lite-tts",
+            tts_voice="Puck",
+            max_output_tokens=200,
+            antigravity_client=fake_ag,
+        )
+        try:
+            assistant.set_provider("dm", "antigravity")
+            assistant.set_provider("group", "openrouter")
+
+            text_dm, markup_dm = _build_provider_menu(assistant, active_scope="dm")
+            self.assertIn("В личке: 🟢 Antigravity", text_dm)
+            self.assertIn("В общем: 🟣 OpenRouter", text_dm)
+            top_row = markup_dm.inline_keyboard[0]
+            self.assertEqual(top_row[0].callback_data, "api_tab:dm")
+            self.assertEqual(top_row[1].callback_data, "api_tab:group")
+            self.assertTrue(top_row[0].text.startswith("🔘"))
+            self.assertTrue(markup_dm.inline_keyboard[1][0].text.startswith("✅"))
+            self.assertEqual(markup_dm.inline_keyboard[1][0].callback_data, "api_set:dm:antigravity")
+
+            text_group, markup_group = _build_provider_menu(assistant, active_scope="group")
+            self.assertTrue(markup_group.inline_keyboard[0][1].text.startswith("🔘"))
+            self.assertTrue(markup_group.inline_keyboard[3][0].text.startswith("✅"))
+            self.assertEqual(markup_group.inline_keyboard[3][0].callback_data, "api_set:group:openrouter")
+
+            reply_text = await assistant.reply(history=[], user_text="привет", scope="dm")
+            self.assertEqual(reply_text, "ответ с подписки")
+            fake_ag.reply.assert_awaited_once()
+
+            assistant.set_provider("group", "antigravity")
+            actions = await assistant.plan_group_actions(
+                recent_context="",
+                summary_context="",
+                user_profiles="",
+                new_messages="[id=10] Вася: привет",
+                style_examples="",
+                available_tools={"reply_to_message", "stay_silent"},
+                tool_executor=AsyncMock(),
+                scope="group",
+            )
+            self.assertEqual(actions[0].name, "reply_to_message")
+            fake_ag.plan_group_actions.assert_awaited_once()
+        finally:
+            await assistant.close()
 
 
 if __name__ == "__main__":

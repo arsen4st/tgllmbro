@@ -9,12 +9,24 @@ from dataclasses import replace
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
-from aiogram.types import ErrorEvent, Message
+from aiogram.types import (
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from aiogram.utils.chat_action import ChatActionSender
 
 from bot.batcher import GroupBatcher, MessageBatch
 from bot.database import ChatEvent, MessageStore
-from bot.gemini import GeminiAssistant
+from bot.gemini import (
+    PROVIDER_LABELS,
+    SCOPE_LABELS,
+    VALID_PROVIDERS,
+    VALID_SCOPES,
+    GeminiAssistant,
+)
 from bot.group_agent import GroupAgent
 
 
@@ -58,6 +70,7 @@ def build_router(
         await message.answer(
             "Я Лисун Син. В личке работаю только с владельцем, а в группах читаю "
             "поток, собираю сообщения в пачки и вмешиваюсь по ситуации.\n\n"
+            "/api — выбор API провайдера (в личке / в общем),\n"
             "/help — справка, /reset — стереть память текущего чата."
         )
 
@@ -69,6 +82,7 @@ def build_router(
             "В личке отвечаю только владельцу. В группе сообщения собираются "
             "в один батч; для гарантированного ответа упомяни меня через "
             f"@{bot_username} или ответь на моё сообщение.\n"
+            "/api (или /provider) — переключение API провайдера (в личке и в общем).\n"
             "/reset — владелец удаляет историю и память текущего чата.\n"
             "/addmeme описание — ответом на картинку добавить мем в базу.\n"
             "/addmlbbmeme описание — добавить MLBB-мем с отдельным поисковым тегом.\n"
@@ -82,6 +96,59 @@ def build_router(
             "/mediametrics — качество единого поиска по последним 500 запросам.\n"
             "/addmlbb заголовок | факт | ссылка — добавить проверенный факт по MLBB."
         )
+
+    @router.message(Command("api", "provider", "providers"))
+    async def api_command(message: Message) -> None:
+        if (
+            message.chat.type != ChatType.PRIVATE
+            or message.from_user is None
+            or message.from_user.id != owner_telegram_id
+        ):
+            return
+        text_body, markup = _build_provider_menu(assistant, active_scope="dm")
+        await message.answer(text_body, reply_markup=markup)
+
+    @router.callback_query(F.data.startswith("api_tab:"))
+    async def api_tab_callback(callback: CallbackQuery) -> None:
+        if callback.from_user.id != owner_telegram_id:
+            await callback.answer("Только для владельца", show_alert=True)
+            return
+        scope = (callback.data or "").partition(":")[2]
+        if scope not in VALID_SCOPES:
+            await callback.answer("Неизвестная вкладка")
+            return
+        text_body, markup = _build_provider_menu(assistant, active_scope=scope)
+        if callback.message is not None:
+            try:
+                await callback.message.edit_text(text_body, reply_markup=markup)
+            except Exception:
+                pass
+        await callback.answer(f"Режим: {SCOPE_LABELS.get(scope, scope)}")
+
+    @router.callback_query(F.data.startswith("api_set:"))
+    async def api_set_callback(callback: CallbackQuery) -> None:
+        if callback.from_user.id != owner_telegram_id:
+            await callback.answer("Только для владельца", show_alert=True)
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await callback.answer("Некорректные данные кнопки")
+            return
+        _, scope, provider = parts
+        if scope not in VALID_SCOPES or provider not in VALID_PROVIDERS:
+            await callback.answer("Неизвестный параметр")
+            return
+        assistant.set_provider(scope, provider)
+        await store.set_bot_setting(f"provider_{scope}", provider)
+        text_body, markup = _build_provider_menu(assistant, active_scope=scope)
+        if callback.message is not None:
+            try:
+                await callback.message.edit_text(text_body, reply_markup=markup)
+            except Exception:
+                pass
+        scope_title = SCOPE_LABELS.get(scope, scope)
+        provider_title = PROVIDER_LABELS.get(provider, provider)
+        await callback.answer(f"{scope_title} → {provider_title}")
 
     @router.message(Command("reset"))
     async def reset(message: Message) -> None:
@@ -497,6 +564,57 @@ def _media_identity(message: Message) -> dict[str, str]:
                 item = item[-1]
             return {"media_kind": kind, "media_file_id": item.file_id, "media_unique_id": item.file_unique_id}
     return {}
+
+
+def _build_provider_menu(
+    assistant: GeminiAssistant,
+    *,
+    active_scope: str = "dm",
+) -> tuple[str, InlineKeyboardMarkup]:
+    scope = active_scope if active_scope in VALID_SCOPES else "dm"
+    dm_provider = assistant.get_provider("dm")
+    group_provider = assistant.get_provider("group")
+    dm_label, dm_model, _ = assistant.provider_info(dm_provider)
+    group_label, group_model, _ = assistant.provider_info(group_provider)
+
+    scope_tab_row = [
+        InlineKeyboardButton(
+            text=("🔘 В личке" if scope == "dm" else "⚪ В личке"),
+            callback_data="api_tab:dm",
+        ),
+        InlineKeyboardButton(
+            text=("🔘 В общем" if scope == "group" else "⚪ В общем"),
+            callback_data="api_tab:group",
+        ),
+    ]
+
+    current_for_scope = assistant.get_provider(scope)
+    provider_order = ("antigravity", "anymodel", "openrouter", "google", "auto")
+    rows: list[list[InlineKeyboardButton]] = [scope_tab_row]
+    for provider in provider_order:
+        label, model_name, configured = assistant.provider_info(provider)
+        prefix = "✅ " if provider == current_for_scope else ""
+        suffix = f" ({model_name})" if provider != "auto" else ""
+        if not configured:
+            suffix += " [нет ключа]"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{prefix}{label}{suffix}",
+                    callback_data=f"api_set:{scope}:{provider}",
+                )
+            ]
+        )
+
+    scope_title = "👤 В личке" if scope == "dm" else "👥 В общем (все группы)"
+    text = (
+        "⚙️ Управление API провайдером\n\n"
+        f"• В личке: {dm_label} ({dm_model})\n"
+        f"• В общем: {group_label} ({group_model})\n\n"
+        f"Выбрана вкладка: {scope_title}\n"
+        "Нажми на провайдера ниже, чтобы сделать его основным:"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _send_long_message(message: Message, text: str) -> None:
